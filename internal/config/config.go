@@ -1,0 +1,181 @@
+package config
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+
+	"maxtg/internal/paths"
+)
+
+// Config holds all runtime settings. Values are loaded from a JSON file and
+// may be overridden by environment variables (env wins).
+type Config struct {
+	// MAX
+	MaxWSURL string `json:"max_ws_url"` // wss://ws-api.oneme.ru/websocket
+	Phone    string `json:"phone"`      // +7XXXXXXXXXX, used for SMS auth
+
+	// Telegram
+	TelegramBotToken string `json:"telegram_bot_token"`
+	TelegramGroupID  int64  `json:"telegram_group_id"` // supergroup with topics enabled (0 = auto-detect)
+
+	// TelegramProxy is an optional SOCKS5 proxy for Telegram traffic ONLY,
+	// e.g. "socks5://user:pass@host:1080" or "socks5://host:1080".
+	// MAX always connects directly (never through this proxy).
+	TelegramProxy string `json:"telegram_proxy"`
+
+	// BrowserCDPURL, if set, enables automatic token refresh: the service reads
+	// the current deviceId+token from a browser logged in to web.max.ru via the
+	// Chrome DevTools Protocol (e.g. "http://127.0.0.1:9222"). Empty = disabled.
+	BrowserCDPURL string `json:"browser_cdp_url"`
+	// BrowserMatchURL is the page URL substring to look for (default web.max.ru).
+	BrowserMatchURL string `json:"browser_match_url"`
+
+	// State file (token, deviceId, chat<->topic map, tg offset)
+	StatePath string `json:"state_path"`
+
+	// IncomingOpcode, when > 0, forces treating this push opcode as a new
+	// message. 0 = rely on the structural heuristic only (recommended until
+	// the real opcode is confirmed during Step 2 discovery).
+	IncomingOpcode int `json:"incoming_opcode"`
+}
+
+// Default values.
+const (
+	defaultWSURL     = "wss://ws-api.oneme.ru/websocket"
+	defaultStatePath = "state.json"
+)
+
+// load reads config.json (if present) and applies env overrides + defaults.
+func load(path string) (*Config, error) {
+	cfg := &Config{
+		MaxWSURL:  defaultWSURL,
+		StatePath: defaultStatePath,
+	}
+
+	if path != "" {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			// Tolerate a UTF-8 BOM (Notepad / PowerShell Set-Content add one).
+			data = bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
+			if err := json.Unmarshal(data, cfg); err != nil {
+				return nil, fmt.Errorf("parse %s: %w", path, err)
+			}
+		} else if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("read %s: %w", path, err)
+		}
+	}
+
+	applyEnv(cfg)
+
+	if cfg.MaxWSURL == "" {
+		cfg.MaxWSURL = defaultWSURL
+	}
+	// Resolve the state file to the shared data dir so the service and console
+	// always use the same file. Empty or relative -> under the data dir.
+	if cfg.StatePath == "" || cfg.StatePath == defaultStatePath {
+		cfg.StatePath = paths.State()
+	} else if !filepath.IsAbs(cfg.StatePath) {
+		cfg.StatePath = filepath.Join(paths.DataDir(), cfg.StatePath)
+	}
+	if cfg.BrowserMatchURL == "" {
+		cfg.BrowserMatchURL = "web.max.ru"
+	}
+	// Default the CDP endpoint to the standard local debug port so browser
+	// token refresh works out of the box (an empty field otherwise disabled it).
+	if cfg.BrowserCDPURL == "" {
+		cfg.BrowserCDPURL = "http://127.0.0.1:9222"
+	}
+	// 0 = unset -> use the confirmed NEW_MESSAGE opcode. Only opcode 128 frames
+	// are treated as incoming messages (set a different value to override).
+	if cfg.IncomingOpcode == 0 {
+		cfg.IncomingOpcode = 128
+	}
+	return cfg, nil
+}
+
+// Load returns a fully-validated config (all fields required to run the bridge).
+func Load(path string) (*Config, error) {
+	cfg, err := load(path)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.Phone == "" {
+		return nil, fmt.Errorf("phone is required (config.phone or MAX_PHONE)")
+	}
+	if cfg.TelegramBotToken == "" {
+		return nil, fmt.Errorf("telegram_bot_token is required (TELEGRAM_BOT_TOKEN)")
+	}
+	// telegram_group_id may be 0: it is auto-detected from the first message
+	// the bot sees in a group, then persisted back to config.json.
+	return cfg, nil
+}
+
+// Save writes the config as pretty JSON (0600, secrets inside).
+func Save(path string, cfg *Config) error {
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
+}
+
+// LoadRaw loads a config with defaults/env but no validation (for the wizard).
+func LoadRaw(path string) (*Config, error) {
+	return load(path)
+}
+
+// Complete reports whether the required fields are set. TelegramGroupID is not
+// required here — it is auto-detected at runtime and persisted.
+func (c *Config) Complete() bool {
+	return c.Phone != "" && c.TelegramBotToken != ""
+}
+
+// LoadPartial returns a config for the console (only phone/ws matter for SMS auth).
+func LoadPartial(path string) (*Config, error) {
+	cfg, err := load(path)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.Phone == "" {
+		return nil, fmt.Errorf("phone is required for SMS auth (config.phone or MAX_PHONE)")
+	}
+	return cfg, nil
+}
+
+func applyEnv(cfg *Config) {
+	if v := os.Getenv("MAX_WS_URL"); v != "" {
+		cfg.MaxWSURL = v
+	}
+	if v := os.Getenv("MAX_PHONE"); v != "" {
+		cfg.Phone = v
+	}
+	if v := os.Getenv("TELEGRAM_BOT_TOKEN"); v != "" {
+		cfg.TelegramBotToken = v
+	}
+	if v := os.Getenv("TELEGRAM_GROUP_ID"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			cfg.TelegramGroupID = n
+		}
+	}
+	if v := os.Getenv("TELEGRAM_PROXY"); v != "" {
+		cfg.TelegramProxy = v
+	}
+	if v := os.Getenv("BROWSER_CDP_URL"); v != "" {
+		cfg.BrowserCDPURL = v
+	}
+	if v := os.Getenv("BROWSER_MATCH_URL"); v != "" {
+		cfg.BrowserMatchURL = v
+	}
+	if v := os.Getenv("STATE_PATH"); v != "" {
+		cfg.StatePath = v
+	}
+	if v := os.Getenv("INCOMING_OPCODE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.IncomingOpcode = n
+		}
+	}
+}

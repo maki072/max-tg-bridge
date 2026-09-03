@@ -1,0 +1,11 @@
+{
+  "max_ws_url": "wss://ws-api.oneme.ru/websocket",
+  "phone": "+7XXXXXXXXXX",
+  "telegram_bot_token": "PUT_YOUR_BOT_TOKEN_HERE",
+  "telegram_group_id": 0,
+  "telegram_proxy": "",
+  "browser_cdp_url": "http://127.0.0.1:9222",
+  "browser_match_url": "web.max.ru",
+  "state_path": "state.json",
+  "incoming_opcode": 0
+}

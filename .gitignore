@@ -1,0 +1,19 @@
+# Secrets and runtime state — NEVER commit
+config.json
+state.json
+state.json.tmp
+*.token
+
+# Build output
+/dist/
+maxtg
+/maxtg
+maxtg.exe
+test.exe
+*.exe
+
+# Editor / tooling temp files
+*.go.[0-9]*
+maxtg-go-tmp-*
+*~
+.DS_Store
