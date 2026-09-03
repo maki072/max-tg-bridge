@@ -1,0 +1,52 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build (Windows amd64)
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+        run: go build -trimpath -ldflags "-s -w" -o dist/maxtg.exe .
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          $stage = "stage"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item dist/maxtg.exe $stage/
+          Copy-Item install.bat,uninstall.bat,config.example.json,README.md $stage/
+          Compress-Archive -Path "$stage/*" -DestinationPath MaxTgBridge-windows-amd64.zip -Force
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: maxtg-windows-amd64
+          path: |
+            dist/maxtg.exe
+            MaxTgBridge-windows-amd64.zip
+
+      - name: Publish release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/maxtg.exe
+            MaxTgBridge-windows-amd64.zip
+          generate_release_notes: true
