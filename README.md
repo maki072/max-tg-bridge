@@ -61,8 +61,6 @@ go build -o dist/maxtg.exe .
 | `state_path` | Файл состояния (токен, deviceId, карта чат↔тема, offset) |
 | `incoming_opcode` | Опкод входящих сообщений (`0` = дефолт `128`) |
 
-Секреты (`config.json`, `state.json`) в репозиторий не попадают — они в `.gitignore`.
-
 ## Благодарности
 
 Протокол MAX задокументирован в [pr0bel1230/max-api-docs](https://github.com/pr0bel1230/max-api-docs); референс‑клиент — [Sharkow1743/MaxAPI](https://github.com/Sharkow1743/MaxAPI).
