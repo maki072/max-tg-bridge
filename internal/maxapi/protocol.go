@@ -35,43 +35,43 @@ const (
 	OpQRAuthPoll          = 289 // QR_AUTH_POLL
 
 	// Contacts / profile / presence
-	OpGetContacts       = 32  // GET_CONTACTS / GET_CONTACT_DETAILS ({contactIds:[...]})
-	OpContactsPresence  = 35  // CONTACTS_PRESENCE
-	OpGetBlocked        = 36  // GET_BLOCKED
-	OpFindByPhone       = 46  // FIND_BY_PHONE_NUMBER
-	OpGetUserInfo       = 177 // GET_USERINFO
-	OpGetCommonChats    = 198 // GET_COMMON_CHATS
-	OpGetSessions       = 96  // GET_SESSIONS
+	OpGetContacts      = 32  // GET_CONTACTS / GET_CONTACT_DETAILS ({contactIds:[...]})
+	OpContactsPresence = 35  // CONTACTS_PRESENCE
+	OpGetBlocked       = 36  // GET_BLOCKED
+	OpFindByPhone      = 46  // FIND_BY_PHONE_NUMBER
+	OpGetUserInfo      = 177 // GET_USERINFO
+	OpGetCommonChats   = 198 // GET_COMMON_CHATS
+	OpGetSessions      = 96  // GET_SESSIONS
 
 	// Chats
-	OpGetChatsBulk = 48  // GET_CHATS_BULK
-	OpGetChats     = 53  // GET_CHATS
-	OpVoid         = 55  // VOID / chats heartbeat
-	OpGetChatInfo  = 61  // GET_CHAT_INFO ({chatId}) -> {chat:{title,type,...}}
-	OpSubscribe    = 75  // SUBSCRIBE_TO_CHAT ({chatId, subscribe})
-	OpChatOperation = 77 // CHAT_OPERATION
-	OpChatShow     = 86  // CHAT_SHOW
-	OpChatActivity = 92  // CHAT_ACTIVITY
-	OpGetFolders   = 272 // GET_FOLDERS
+	OpGetChatsBulk  = 48  // GET_CHATS_BULK
+	OpGetChats      = 53  // GET_CHATS
+	OpVoid          = 55  // VOID / chats heartbeat
+	OpGetChatInfo   = 61  // GET_CHAT_INFO ({chatId}) -> {chat:{title,type,...}}
+	OpSubscribe     = 75  // SUBSCRIBE_TO_CHAT ({chatId, subscribe})
+	OpChatOperation = 77  // CHAT_OPERATION
+	OpChatShow      = 86  // CHAT_SHOW
+	OpChatActivity  = 92  // CHAT_ACTIVITY
+	OpGetFolders    = 272 // GET_FOLDERS
 
 	// Messages
-	OpGetHistory     = 49  // GET_HISTORY
-	OpMarkAsRead     = 50  // MARK_AS_READ
-	OpMsgSend        = 64  // MSG_SEND — send a message
-	OpMsgTyping      = 65  // MSG_TYPING
-	OpMsgDelete      = 66  // MSG_DELETE
-	OpMsgEdit        = 67  // MSG_EDIT
-	OpForwardMessage = 70  // FORWARD_MESSAGE
-	OpSearchMessages = 73  // SEARCH_MESSAGES
+	OpGetHistory     = 49 // GET_HISTORY
+	OpMarkAsRead     = 50 // MARK_AS_READ
+	OpMsgSend        = 64 // MSG_SEND — send a message
+	OpMsgTyping      = 65 // MSG_TYPING
+	OpMsgDelete      = 66 // MSG_DELETE
+	OpMsgEdit        = 67 // MSG_EDIT
+	OpForwardMessage = 70 // FORWARD_MESSAGE
+	OpSearchMessages = 73 // SEARCH_MESSAGES
 
 	// Media / files / stickers
-	OpGetPresetAvatars = 25 // GET_PRESET_AVATARS
-	OpStickerSync      = 26 // STICKER_SYNC
-	OpStickerData      = 27 // STICKER_DATA
-	OpAnimojiGet       = 28 // ANIMOJI_AND_STICKER_GET
-	OpImageUploadURL   = 80 // IMAGE_UPLOAD_URL
-	OpImageUploadSmile = 81 // IMAGE_UPLOAD_IUSMILE
-	OpFileUpload       = 87 // FILE_UPLOAD
+	OpGetPresetAvatars = 25  // GET_PRESET_AVATARS
+	OpStickerSync      = 26  // STICKER_SYNC
+	OpStickerData      = 27  // STICKER_DATA
+	OpAnimojiGet       = 28  // ANIMOJI_AND_STICKER_GET
+	OpImageUploadURL   = 80  // IMAGE_UPLOAD_URL
+	OpImageUploadSmile = 81  // IMAGE_UPLOAD_IUSMILE
+	OpFileUpload       = 87  // FILE_UPLOAD
 	OpGetBanners       = 302 // GET_BANNERS
 
 	// Calls
@@ -81,15 +81,16 @@ const (
 	OpCallToken   = 158 // CALL_TOKEN
 
 	// Server -> client pushes
-	OpPushNewMessage  = 128 // NEW_MESSAGE (incoming message)
-	OpPushTyping      = 129 // NOTIF_TYPING
-	OpPushRead        = 130 // NOTIF_READ
-	OpPushPresence    = 132 // NOTIF_PRESENCE
-	OpPushAttach      = 136 // NOTIF_ATTACH
-	OpPushIncomingCall = 137 // NOTIF_INCOMING_CALL
+	OpPushNewMessage     = 128 // NEW_MESSAGE (incoming message)
+	OpPushTyping         = 129 // NOTIF_TYPING
+	OpPushRead           = 130 // NOTIF_READ
+	OpPushPresence       = 132 // NOTIF_PRESENCE
+	OpPushAttach         = 136 // NOTIF_ATTACH
+	OpPushIncomingCall   = 137 // NOTIF_INCOMING_CALL
 	OpPushMsgDeleteRange = 140 // NOTIF_MSG_DELETE_RANGE
-	OpPushMsgDelete   = 142 // NOTIF_MSG_DELETE
-	OpPushReaction    = 156 // NOTIF_REACTION
+	OpPushMsgDelete      = 142 // NOTIF_MSG_DELETE
+	OpPushReactionFlat   = 155 // reaction push, flat payload (confirmed live: {chatId,messageId,counters,totalCount})
+	OpPushReaction       = 156 // NOTIF_REACTION, payload nested under "reactionInfo" per docs
 )
 
 // nameEntry / contactInfo mirror the MAX contact shape: names is an array of
@@ -134,7 +135,37 @@ var ignoredPushOpcodes = map[int]bool{
 	137: true, // NOTIF_INCOMING_CALL
 	140: true, // NOTIF_MSG_DELETE_RANGE
 	142: true, // NOTIF_MSG_DELETE
-	156: true, // NOTIF_REACTION
+	// 156 (NOTIF_REACTION) is handled explicitly in handlePush, not ignored.
+}
+
+// ReactionCounter is one emoji's tally on a message.
+type ReactionCounter struct {
+	Reaction string `json:"reaction"`
+	Count    int    `json:"count"`
+}
+
+// reactionPush is the wire shape of a reaction push. Two variants seen live:
+// opcode 156 nests counters under "reactionInfo" (matches the docs); opcode
+// 155 puts them flat at the top level. Both are parsed into the same struct
+// so tryReaction can just prefer whichever side came populated.
+type reactionPush struct {
+	ChatID       json.Number       `json:"chatId"`
+	MessageID    json.Number       `json:"messageId"`
+	Counters     []ReactionCounter `json:"counters"`   // opcode 155 (flat)
+	TotalCount   int               `json:"totalCount"` // opcode 155 (flat)
+	ReactionInfo *struct {
+		Counters     []ReactionCounter `json:"counters"`
+		YourReaction string            `json:"yourReaction"`
+		TotalCount   int               `json:"totalCount"`
+	} `json:"reactionInfo"` // opcode 156 (nested)
+}
+
+// IncomingReaction is a normalized NOTIF_REACTION event forwarded to the bridge.
+type IncomingReaction struct {
+	ChatID     int64
+	MessageID  string
+	Counters   []ReactionCounter
+	TotalCount int
 }
 
 // Frame is a single WebSocket JSON frame.
@@ -176,27 +207,136 @@ func defaultUserAgent() UserAgent {
 	}
 }
 
+// Attachment is a normalized media attachment of an incoming message.
+type Attachment struct {
+	Kind     string // "photo" | "file" | "video" | "voice" | "poll" | "other"
+	URL      string // direct, publicly fetchable URL (photo/file/video only)
+	Name     string // file name (for documents) or a human label for other kinds
+	Duration int64  // duration in ms (voice notes)
+	Text     string // extra text (e.g. a poll question, when the server includes one)
+}
+
 // IncomingMessage is a normalized new message forwarded to the bridge.
 type IncomingMessage struct {
-	ChatID     int64
-	ChatTitle  string
-	SenderID   int64
-	SenderName string
-	MessageID  string
-	Text       string
-	Opcode     int // raw push opcode it arrived on (useful for discovery)
+	ChatID      int64
+	ChatTitle   string
+	SenderID    int64
+	SenderName  string
+	MessageID   string
+	Text        string
+	Attachments []Attachment
+	Opcode      int  // raw push opcode it arrived on (useful for discovery)
+	Outgoing    bool // true if sent by us (self) from the MAX app/web
+	Forwarded   bool // true if this is a forwarded message
+}
+
+// attach is a message attachment as MAX sends it. PHOTO exposes a public webp
+// image at baseUrl; FILE/VIDEO expose fileUrl/url. Voice notes (sent as _type
+// AUDIO, or UNSUPPORTED when the server decides our WEB device type can't
+// render them) carry duration+audioId+token instead of a fetchable URL. Polls
+// carry a question under one of a few possible field names — best-effort
+// parsed since the wire schema for MAX polls is not documented anywhere.
+type attach struct {
+	Type     string `json:"_type"`
+	BaseURL  string `json:"baseUrl"`
+	FileURL  string `json:"fileUrl"`
+	URL      string `json:"url"`
+	Name     string `json:"name"`
+	Duration int64  `json:"duration"` // ms, present on voice/audio attaches
+	Text     string `json:"text"`     // best-effort: poll question, if present here
+	Question string `json:"question"` // best-effort: poll question, alt field name
+}
+
+// msgBody is a message body (self-referential: a forwarded message nests the
+// original under link.message, leaving the outer text/attaches empty).
+type msgBody struct {
+	ID       json.Number `json:"id"`
+	Text     string      `json:"text"`
+	Sender   json.Number `json:"sender"`
+	Type     string      `json:"type"`
+	Time     int64       `json:"time"`
+	Attaches []attach    `json:"attaches"`
+	Link     *struct {
+		Type    string   `json:"type"`
+		Message *msgBody `json:"message"`
+	} `json:"link"`
 }
 
 // pushMessage is the minimal shape of a message-bearing push payload.
 type pushMessage struct {
 	ChatID  json.Number `json:"chatId"`
-	Message *struct {
-		ID     json.Number `json:"id"`
-		Text   string      `json:"text"`
-		Sender json.Number `json:"sender"`
-		Type   string      `json:"type"`
-		Time   int64       `json:"time"`
-	} `json:"message"`
+	Message *msgBody    `json:"message"`
+}
+
+// toAttachments normalizes MAX attaches into forwardable Attachments.
+//
+// IMPORTANT: every attach must turn into *something* — silently dropping an
+// attach (as the old PHOTO/FILE/VIDEO-only switch did whenever a URL field
+// was missing or the type was unrecognized) is what made voice messages,
+// polls, and the occasional photo without a "baseUrl" vanish entirely: with
+// no attachment produced, a message with empty text and a dropped attach
+// looks like a contentless service push and tryMessage discards it outright.
+// Unknown/undocumented types fall through to "other" so the bridge still
+// posts a placeholder into Telegram instead of losing the message.
+func toAttachments(as []attach) []Attachment {
+	var out []Attachment
+	for _, a := range as {
+		switch a.Type {
+		case "PHOTO":
+			u := a.BaseURL
+			if u == "" {
+				u = a.URL
+			}
+			if u == "" {
+				u = a.FileURL
+			}
+			if u != "" {
+				out = append(out, Attachment{Kind: "photo", URL: u})
+			} else {
+				out = append(out, Attachment{Kind: "other", Name: "PHOTO"})
+			}
+		case "FILE":
+			u := a.FileURL
+			if u == "" {
+				u = a.URL
+			}
+			if u != "" {
+				out = append(out, Attachment{Kind: "file", URL: u, Name: a.Name})
+			} else {
+				out = append(out, Attachment{Kind: "other", Name: "FILE " + a.Name})
+			}
+		case "VIDEO":
+			u := a.URL
+			if u == "" {
+				u = a.FileURL
+			}
+			if u != "" {
+				out = append(out, Attachment{Kind: "video", URL: u, Name: a.Name})
+			} else {
+				out = append(out, Attachment{Kind: "other", Name: "VIDEO"})
+			}
+		case "AUDIO", "UNSUPPORTED":
+			// Voice notes: the server sometimes reports the real type (AUDIO),
+			// sometimes substitutes UNSUPPORTED for our WEB device type — both
+			// carry a "duration" (ms) but no fetchable URL in either case.
+			if a.Duration > 0 {
+				out = append(out, Attachment{Kind: "voice", Duration: a.Duration})
+			} else {
+				out = append(out, Attachment{Kind: "other", Name: a.Type})
+			}
+		case "POLL":
+			q := a.Text
+			if q == "" {
+				q = a.Question
+			}
+			out = append(out, Attachment{Kind: "poll", Text: q})
+		case "CONTROL":
+			// Service-only markers (e.g. "bot started") — not user content.
+		default:
+			out = append(out, Attachment{Kind: "other", Name: a.Type})
+		}
+	}
+	return out
 }
 
 // NewDeviceID returns a fresh random UUIDv4 string, for callers (store,

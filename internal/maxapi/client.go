@@ -1,10 +1,13 @@
-﻿package maxapi
+package maxapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"strings"
@@ -39,7 +42,14 @@ func maxTLSDial(ctx context.Context, network, addr string) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	uconn := utls.UClient(raw, &utls.Config{ServerName: host}, utls.HelloFirefox_Auto)
+	// Force ALPN to http/1.1 only. A real browser opening a WebSocket never
+	// offers h2 on that connection (WS upgrade is HTTP/1.1-only); leaving ALPN
+	// at the Firefox preset's default (h2 + http/1.1) lets MAX's edge pick h2
+	// on some routes/times, which produces raw HTTP/2 frames on the wire that
+	// gorilla/websocket's HTTP/1.1 Upgrade write/read chokes on with
+	// "malformed HTTP response" (the bytes are literally an HTTP/2 SETTINGS
+	// frame: 00 00 1e 04 00 ...). Pinning NextProtos avoids that entirely.
+	uconn := utls.UClient(raw, &utls.Config{ServerName: host, NextProtos: []string{"http/1.1"}}, utls.HelloFirefox_Auto)
 	if err := uconn.HandshakeContext(ctx); err != nil {
 		raw.Close()
 		return nil, fmt.Errorf("utls handshake: %w", err)
@@ -83,7 +93,7 @@ func Diagnose(wsURL string) string {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	uconn := utls.UClient(raw, &utls.Config{ServerName: hostname}, utls.HelloFirefox_Auto)
+	uconn := utls.UClient(raw, &utls.Config{ServerName: hostname, NextProtos: []string{"http/1.1"}}, utls.HelloFirefox_Auto)
 	if err := uconn.HandshakeContext(ctx); err != nil {
 		fmt.Fprintf(&sb, "TLS: FAIL %v\n", err)
 		raw.Close()
@@ -173,12 +183,17 @@ type Client struct {
 	connected bool
 	lastErr   string
 
-	onMessage func(IncomingMessage)
-	saveToken func(deviceID, token, userAgent, cookie string)
-	loadToken func() (deviceID, token, cookie string)
-	readCode  func() string
-	onCaptcha func(link string) string
-	refresh   func() (deviceID, token, userAgent, cookie string, err error)
+	onMessage  func(IncomingMessage)
+	onReaction func(IncomingReaction)
+	saveToken  func(deviceID, token, userAgent, cookie string)
+	loadToken  func() (deviceID, token, cookie string)
+	readCode   func() string
+	onCaptcha  func(link string) string
+	refresh    func() (deviceID, token, userAgent, cookie string, err error)
+
+	deliver     chan IncomingMessage  // decouples delivery (+ MAX lookups) from readLoop
+	reactions   chan IncomingReaction // decouples reaction delivery from readLoop
+	attachReady chan struct{}         // signalled on NOTIF_ATTACH (opcode 136)
 
 	debugMu  sync.Mutex
 	debugLog []string
@@ -194,6 +209,7 @@ type Options struct {
 	ForceOpcode int
 	AllowSMS    bool
 	OnMessage   func(IncomingMessage)
+	OnReaction  func(IncomingReaction)
 	SaveToken   func(deviceID, token, userAgent, cookie string)
 	LoadToken   func() (deviceID, token, cookie string)
 	ReadSMSCode func() string
@@ -203,28 +219,34 @@ type Options struct {
 
 func New(o Options) *Client {
 	return &Client{
-		url:       o.URL,
-		origin:    "https://web.max.ru",
-		phone:     o.Phone,
-		forceOp:   o.ForceOpcode,
-		deviceID:  o.DeviceID,
-		token:     o.Token,
-		userAgent: o.UserAgent,
-		cookie:    o.Cookie,
-		allowSMS:  o.AllowSMS,
-		pending:   make(map[int]chan *Frame),
-		chatName:  make(map[int64]string),
-		userName:  make(map[int64]string),
-		onMessage: o.OnMessage,
-		saveToken: o.SaveToken,
-		loadToken: o.LoadToken,
-		readCode:  o.ReadSMSCode,
-		onCaptcha: o.OnCaptcha,
-		refresh:   o.Refresh,
+		url:         o.URL,
+		origin:      "https://web.max.ru",
+		phone:       o.Phone,
+		forceOp:     o.ForceOpcode,
+		deviceID:    o.DeviceID,
+		token:       o.Token,
+		userAgent:   o.UserAgent,
+		cookie:      o.Cookie,
+		allowSMS:    o.AllowSMS,
+		pending:     make(map[int]chan *Frame),
+		chatName:    make(map[int64]string),
+		userName:    make(map[int64]string),
+		deliver:     make(chan IncomingMessage, 256),
+		reactions:   make(chan IncomingReaction, 256),
+		attachReady: make(chan struct{}, 1),
+		onMessage:   o.OnMessage,
+		onReaction:  o.OnReaction,
+		saveToken:   o.SaveToken,
+		loadToken:   o.LoadToken,
+		readCode:    o.ReadSMSCode,
+		onCaptcha:   o.OnCaptcha,
+		refresh:     o.Refresh,
 	}
 }
 
 func (c *Client) Run() {
+	go c.deliverLoop()
+	go c.reactionLoop()
 	attempt := 0
 	for {
 		start := time.Now()
@@ -431,7 +453,9 @@ func (c *Client) requestCaptcha() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	var r struct{ Link string `json:"link"` }
+	var r struct {
+		Link string `json:"link"`
+	}
 	if err := json.Unmarshal(resp.Payload, &r); err != nil {
 		return "", err
 	}
@@ -460,7 +484,9 @@ func (c *Client) smsLogin(captchaToken string) error {
 	if err != nil {
 		return err
 	}
-	var vr struct{ Token string `json:"token"` }
+	var vr struct {
+		Token string `json:"token"`
+	}
 	if err := json.Unmarshal(resp.Payload, &vr); err != nil {
 		return err
 	}
@@ -468,11 +494,17 @@ func (c *Client) smsLogin(captchaToken string) error {
 	if err != nil {
 		return err
 	}
-	
-	type loginStruct struct { Token string `json:"token"` }
-	type pLoginStruct struct { Login loginStruct `json:"LOGIN"` }
-	type ceStruct struct { TokenAttrs pLoginStruct `json:"tokenAttrs"` }
-	
+
+	type loginStruct struct {
+		Token string `json:"token"`
+	}
+	type pLoginStruct struct {
+		Login loginStruct `json:"LOGIN"`
+	}
+	type ceStruct struct {
+		TokenAttrs pLoginStruct `json:"tokenAttrs"`
+	}
+
 	var ce ceStruct
 	if err := json.Unmarshal(enter.Payload, &ce); err != nil {
 		return err
@@ -497,9 +529,16 @@ func (c *Client) login() error {
 	if err != nil {
 		return err
 	}
-	type idStruct struct { ID json.Number `json:"id"` }
-	type TitleStruct struct { ID json.Number `json:"id"`; Title string `json:"title"` }
-	type profileStruct struct { Contact idStruct `json:"contact"` }
+	type idStruct struct {
+		ID json.Number `json:"id"`
+	}
+	type TitleStruct struct {
+		ID    json.Number `json:"id"`
+		Title string      `json:"title"`
+	}
+	type profileStruct struct {
+		Contact idStruct `json:"contact"`
+	}
 	type lrStruct struct {
 		Profile profileStruct `json:"profile"`
 		Chats   []TitleStruct `json:"chats"`
@@ -545,6 +584,181 @@ func (c *Client) fetchChatTitle(chatID int64) string {
 	return r.Chat.Title
 }
 
+// ChatIcon returns the chat's avatar URL (baseIconUrl / picture.url) or "".
+func (c *Client) ChatIcon(chatID int64) string {
+	resp, err := c.request(OpGetChatInfo, map[string]any{"chatId": chatID}, 10*time.Second)
+	if err != nil {
+		return ""
+	}
+	var r struct {
+		Chat struct {
+			BaseIconURL string `json:"baseIconUrl"`
+			Picture     struct {
+				URL string `json:"url"`
+			} `json:"picture"`
+		} `json:"chat"`
+	}
+	if json.Unmarshal(resp.Payload, &r) != nil {
+		return ""
+	}
+	if r.Chat.BaseIconURL != "" {
+		return r.Chat.BaseIconURL
+	}
+	return r.Chat.Picture.URL
+}
+
+// History returns up to count recent messages of a chat (oldest-first), enriched
+// with names, for backfilling a freshly created topic.
+func (c *Client) History(chatID int64, count int) []IncomingMessage {
+	if count <= 0 {
+		return nil
+	}
+	resp, err := c.request(OpGetHistory, map[string]any{
+		"chatId": chatID, "forward": 0, "backward": count,
+		"backwardTime": 0, "forwardTime": 0, "getChat": false,
+		"from": time.Now().UnixMilli(), "getMessages": true, "interactive": false,
+	}, 20*time.Second)
+	if err != nil {
+		return nil
+	}
+	var r struct {
+		Messages []struct {
+			ID       json.Number `json:"id"`
+			Text     string      `json:"text"`
+			Sender   json.Number `json:"sender"`
+			Attaches []attach    `json:"attaches"`
+		} `json:"messages"`
+	}
+	if json.Unmarshal(resp.Payload, &r) != nil {
+		return nil
+	}
+	out := make([]IncomingMessage, 0, len(r.Messages))
+	for _, m := range r.Messages {
+		att := toAttachments(m.Attaches)
+		if strings.TrimSpace(m.Text) == "" && len(att) == 0 {
+			continue
+		}
+		sid := numToInt64(m.Sender)
+		im := IncomingMessage{
+			MessageID:   m.ID.String(),
+			ChatID:      chatID,
+			SenderID:    sid,
+			Text:        m.Text,
+			Attachments: att,
+			Outgoing:    sid != 0 && sid == c.selfID,
+		}
+		c.enrich(&im)
+		out = append(out, im)
+	}
+	// GET_HISTORY returns newest-first; reverse to chronological order.
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out
+}
+
+// SendFile uploads a file to MAX storage and posts it as a message attachment.
+// Returns the created message id (for echo dedupe).
+func (c *Client) SendFile(chatID int64, name string, data []byte, caption string) (string, error) {
+	if name == "" {
+		name = "file"
+	}
+	ext := ""
+	if i := strings.LastIndexByte(name, '.'); i >= 0 {
+		ext = strings.ToLower(name[i+1:])
+	}
+	resp, err := c.request(OpFileUpload, map[string]any{
+		"name": name, "size": len(data), "ext": ext, "count": 1,
+	}, 15*time.Second)
+	if err != nil {
+		return "", err
+	}
+	var up struct {
+		Info []struct {
+			URL    string      `json:"url"`
+			FileID json.Number `json:"fileId"` // numeric on the wire
+			Token  string      `json:"token"`
+		} `json:"info"`
+	}
+	if json.Unmarshal(resp.Payload, &up) != nil || len(up.Info) == 0 {
+		log.Printf("[max] FILE_UPLOAD raw response: %s", string(resp.Payload))
+		return "", fmt.Errorf("no upload slot in FILE_UPLOAD response")
+	}
+	slot := up.Info[0]
+	// Drain any stale signal, upload, then wait for NOTIF_ATTACH (the server
+	// confirms the upload is attached to our session before MSG_SEND).
+	select {
+	case <-c.attachReady:
+	default:
+	}
+	if err := httpUpload(slot.URL, name, data); err != nil {
+		return "", err
+	}
+	select {
+	case <-c.attachReady:
+	case <-time.After(15 * time.Second):
+		// proceed anyway; some uploads don't emit a push
+	}
+	cid := time.Now().UnixNano()
+	sr, err := c.request(OpMsgSend, map[string]any{
+		"chatId": chatID,
+		"message": map[string]any{
+			"text":     caption,
+			"cid":      cid,
+			"elements": []any{},
+			"attaches": []map[string]any{{
+				"_type": "FILE", "fileId": slot.FileID, "token": slot.Token,
+				"name": name, "size": len(data),
+			}},
+		},
+		"notify": true,
+	}, 20*time.Second)
+	if err != nil {
+		return "", err
+	}
+	var mr struct {
+		Message struct {
+			ID json.Number `json:"id"`
+		} `json:"message"`
+	}
+	if json.Unmarshal(sr.Payload, &mr) == nil {
+		return mr.Message.ID.String(), nil
+	}
+	return "", nil
+}
+
+// httpUpload POSTs a file to a MAX storage URL via multipart/form-data.
+func httpUpload(url, name string, data []byte) error {
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	fw, err := w.CreateFormFile("file", name)
+	if err != nil {
+		return err
+	}
+	if _, err := fw.Write(data); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	req, err := http.NewRequest("POST", url, &buf)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	client := &http.Client{Timeout: 90 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("upload http %d: %s", resp.StatusCode, string(b))
+	}
+	return nil
+}
+
 // fetchUserName resolves a user's display name via GET_CONTACTS (opcode 32).
 // MUST be called off the read loop.
 func (c *Client) fetchUserName(userID int64) string {
@@ -569,11 +783,11 @@ func (c *Client) fetchUserName(userID int64) string {
 	return ""
 }
 
-func (c *Client) SendMessage(chatID int64, text string) error {
+func (c *Client) SendMessage(chatID int64, text string) (string, error) {
 	// MAX expects the message wrapped: {chatId, message:{text,cid,elements,attaches}, notify}
 	// (matches the web client / MaxBridge). A flat {text} payload is ignored.
 	cid := time.Now().UnixNano()
-	_, err := c.request(OpMsgSend, map[string]any{
+	resp, err := c.request(OpMsgSend, map[string]any{
 		"chatId": chatID,
 		"message": map[string]any{
 			"text":     text,
@@ -583,7 +797,20 @@ func (c *Client) SendMessage(chatID int64, text string) error {
 		},
 		"notify": true,
 	}, 15*time.Second)
-	return err
+	if err != nil {
+		return "", err
+	}
+	// The response echoes the stored message; return its id so the caller can
+	// mark it seen and skip the self-echo push that follows (avoids a duplicate).
+	var r struct {
+		Message struct {
+			ID json.Number `json:"id"`
+		} `json:"message"`
+	}
+	if json.Unmarshal(resp.Payload, &r) == nil && r.Message.ID != "" {
+		return r.Message.ID.String(), nil
+	}
+	return "", nil
 }
 
 func (c *Client) request(opcode int, payload any, timeout time.Duration) (*Frame, error) {
@@ -657,14 +884,25 @@ func (c *Client) handlePush(f Frame) {
 		c.debugLog = c.debugLog[1:]
 	}
 	s := string(f.Payload)
-	if len(s) > 1000 {
-		s = s[:1000] + "..."
+	if len(s) > 4000 {
+		s = s[:4000] + "..."
 	}
 	c.debugLog = append(c.debugLog, fmt.Sprintf("OPCODE=%d PAYLOAD=%s", f.Opcode, s))
 	c.debugMu.Unlock()
 
 	if f.Opcode == OpPing {
 		_ = c.writeFrame(Frame{Ver: ProtocolVersion, Cmd: CmdRequest, Seq: 0, Opcode: OpPing, Payload: json.RawMessage(`{"interactive":true}`)})
+		return
+	}
+	if f.Opcode == OpPushAttach { // NOTIF_ATTACH: an upload finished
+		select {
+		case c.attachReady <- struct{}{}:
+		default:
+		}
+		return
+	}
+	if f.Opcode == OpPushReaction || f.Opcode == OpPushReactionFlat { // someone (re)reacted
+		c.tryReaction(f)
 		return
 	}
 	if c.tryMessage(f) {
@@ -687,7 +925,22 @@ func (c *Client) tryMessage(f Frame) bool {
 	if err := json.Unmarshal(f.Payload, &pm); err != nil {
 		return false
 	}
-	if pm.Message == nil || strings.TrimSpace(pm.Message.Text) == "" {
+	if pm.Message == nil {
+		return false
+	}
+	text := pm.Message.Text
+	attachments := toAttachments(pm.Message.Attaches)
+	forwarded := false
+	// Forwarded messages nest the real content under link.message.
+	if strings.TrimSpace(text) == "" && len(attachments) == 0 &&
+		pm.Message.Link != nil && pm.Message.Link.Message != nil {
+		inner := pm.Message.Link.Message
+		text = inner.Text
+		attachments = toAttachments(inner.Attaches)
+		forwarded = true
+	}
+	// Skip pure service pushes (no text AND no media); keep media-only messages.
+	if strings.TrimSpace(text) == "" && len(attachments) == 0 {
 		return false
 	}
 	chatID := numToInt64(pm.ChatID)
@@ -695,57 +948,119 @@ func (c *Client) tryMessage(f Frame) bool {
 	if chatID == 0 {
 		return false
 	}
-	if senderID != 0 && senderID == c.selfID {
-		return true
-	}
 	if c.onMessage == nil {
 		return true
 	}
+	msg := IncomingMessage{
+		MessageID:   pm.Message.ID.String(),
+		ChatID:      chatID,
+		SenderID:    senderID,
+		Text:        text,
+		Attachments: attachments,
+		Outgoing:    senderID != 0 && senderID == c.selfID,
+		Forwarded:   forwarded,
+	}
+	// Hand off to the delivery worker (never block or make MAX requests on the
+	// read loop — that would deadlock, since replies arrive on this same loop).
+	select {
+	case c.deliver <- msg:
+	default:
+		log.Printf("[max] deliver queue full; dropping message %s", msg.MessageID)
+	}
+	return true
+}
+
+// tryReaction parses a NOTIF_REACTION push and queues it for delivery.
+func (c *Client) tryReaction(f Frame) {
+	var rp reactionPush
+	if err := json.Unmarshal(f.Payload, &rp); err != nil {
+		return
+	}
+	chatID := numToInt64(rp.ChatID)
+	if chatID == 0 || c.onReaction == nil {
+		return
+	}
+	counters, total := rp.Counters, rp.TotalCount
+	if rp.ReactionInfo != nil {
+		counters, total = rp.ReactionInfo.Counters, rp.ReactionInfo.TotalCount
+	}
+	r := IncomingReaction{
+		ChatID:     chatID,
+		MessageID:  rp.MessageID.String(),
+		Counters:   counters,
+		TotalCount: total,
+	}
+	select {
+	case c.reactions <- r:
+	default:
+		log.Printf("[max] reaction queue full; dropping reaction on message %s", r.MessageID)
+	}
+}
+
+// reactionLoop hands queued reactions to onReaction, off the read loop (the
+// bridge's Telegram call must never block frame reads).
+func (c *Client) reactionLoop() {
+	for r := range c.reactions {
+		func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Printf("[max] onReaction panic: %v", rec)
+				}
+			}()
+			c.onReaction(r)
+		}()
+	}
+}
+
+// deliverLoop enriches queued messages (chat title, sender name — via MAX
+// lookups that are safe here, off the read loop) and hands them to onMessage,
+// preserving order.
+func (c *Client) deliverLoop() {
+	for msg := range c.deliver {
+		c.enrich(&msg)
+		if c.onMessage != nil {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("[max] onMessage panic: %v", r)
+					}
+				}()
+				c.onMessage(msg)
+			}()
+		}
+	}
+}
+
+func (c *Client) enrich(msg *IncomingMessage) {
 	c.chatMu.RLock()
-	title := c.chatName[chatID]
-	sender := c.userName[senderID]
+	title := c.chatName[msg.ChatID]
+	sender := c.userName[msg.SenderID]
 	c.chatMu.RUnlock()
 
-	msg := IncomingMessage{
-		MessageID:  pm.Message.ID.String(),
-		ChatID:     chatID,
-		SenderID:   senderID,
-		Text:       pm.Message.Text,
+	if title == "" {
+		if t := c.fetchChatTitle(msg.ChatID); t != "" {
+			title = t
+			c.chatMu.Lock()
+			c.chatName[msg.ChatID] = t
+			c.chatMu.Unlock()
+		} else {
+			title = fmt.Sprintf("Chat %d", msg.ChatID)
+		}
 	}
-
-	if title != "" && (sender != "" || senderID == 0) {
-		msg.ChatTitle = title
-		msg.SenderName = sender
-		c.onMessage(msg)
-		return true
+	if msg.Outgoing {
+		sender = "Вы"
+	} else if sender == "" && msg.SenderID != 0 {
+		if n := c.fetchUserName(msg.SenderID); n != "" {
+			sender = n
+			c.chatMu.Lock()
+			c.userName[msg.SenderID] = n
+			c.chatMu.Unlock()
+		} else {
+			sender = fmt.Sprintf("User %d", msg.SenderID)
+		}
 	}
-
-	// Chat title and/or sender name unknown — resolve them off the read loop
-	// (GET_CHAT_INFO / GET_CONTACTS), cache, then forward with proper names.
-	go func() {
-		if title == "" {
-			if t := c.fetchChatTitle(chatID); t != "" {
-				title = t
-				c.chatMu.Lock(); c.chatName[chatID] = t; c.chatMu.Unlock()
-			}
-		}
-		if sender == "" && senderID != 0 {
-			if n := c.fetchUserName(senderID); n != "" {
-				sender = n
-				c.chatMu.Lock(); c.userName[senderID] = n; c.chatMu.Unlock()
-			}
-		}
-		if title == "" {
-			title = fmt.Sprintf("Chat %d", chatID)
-		}
-		if sender == "" && senderID != 0 {
-			sender = fmt.Sprintf("User %d", senderID)
-		}
-		msg.ChatTitle = title
-		msg.SenderName = sender
-		c.onMessage(msg)
-	}()
-	return true
+	msg.ChatTitle = title
+	msg.SenderName = sender
 }
 
 func (c *Client) heartbeat(done chan struct{}) {

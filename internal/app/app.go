@@ -1,4 +1,4 @@
-﻿package app
+package app
 
 import (
 	"log"
@@ -81,9 +81,17 @@ func (p *Program) run() {
 			}()
 			br.OnMaxMessage(m)
 		},
-		SaveToken:   func(d, t, ua, ck string) { st.SetCredentials(d, t, ua, ck) },
-		LoadToken:   func() (string, string, string) { d, t, _, ck := st.GetCredentials(); return d, t, ck },
-		Refresh:     refresh,
+		OnReaction: func(r maxapi.IncomingReaction) {
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Printf("[app] recovered from panic handling MAX reaction: %v", rec)
+				}
+			}()
+			br.OnMaxReaction(r)
+		},
+		SaveToken: func(d, t, ua, ck string) { st.SetCredentials(d, t, ua, ck) },
+		LoadToken: func() (string, string, string) { d, t, _, ck := st.GetCredentials(); return d, t, ck },
+		Refresh:   refresh,
 	})
 	br = bridge.New(maxClient, bot, st, p.cfg, p.configPath)
 

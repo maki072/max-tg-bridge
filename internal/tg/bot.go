@@ -6,15 +6,64 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"golang.org/x/net/proxy"
 )
+
+// SendPhoto uploads a photo (JPEG/PNG bytes) into a topic thread.
+func (b *Bot) SendPhoto(threadID int, photo []byte, caption string) error {
+	return b.sendMedia("sendPhoto", "photo", "photo.jpg", photo, threadID, caption)
+}
+
+// SendDocument uploads any file into a topic thread.
+func (b *Bot) SendDocument(threadID int, doc []byte, filename, caption string) error {
+	if filename == "" {
+		filename = "file"
+	}
+	return b.sendMedia("sendDocument", "document", filename, doc, threadID, caption)
+}
+
+// sendMedia posts a multipart file upload to the group/topic.
+func (b *Bot) sendMedia(method, field, filename string, data []byte, threadID int, caption string) error {
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	_ = w.WriteField("chat_id", strconv.FormatInt(b.GroupID(), 10))
+	if threadID != 0 {
+		_ = w.WriteField("message_thread_id", strconv.Itoa(threadID))
+	}
+	if caption != "" {
+		_ = w.WriteField("caption", caption)
+	}
+	fw, err := w.CreateFormFile(field, filename)
+	if err != nil {
+		return err
+	}
+	if _, err := fw.Write(data); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	resp, err := b.http.Post(b.base+"/"+method, w.FormDataContentType(), &buf)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var ar apiResp
+	if json.Unmarshal(body, &ar) == nil && !ar.OK {
+		return fmt.Errorf("%s: %s", method, ar.Description)
+	}
+	return nil
+}
 
 // Bot is a minimal Telegram Bot API client built on net/http.
 type Bot struct {
@@ -176,7 +225,16 @@ type Update struct {
 		MessageID       int64  `json:"message_id"`
 		MessageThreadID int    `json:"message_thread_id"`
 		Text            string `json:"text"`
-		From            struct {
+		Caption         string `json:"caption"`
+		Photo           []struct {
+			FileID   string `json:"file_id"`
+			FileSize int    `json:"file_size"`
+		} `json:"photo"`
+		Document *struct {
+			FileID   string `json:"file_id"`
+			FileName string `json:"file_name"`
+		} `json:"document"`
+		From struct {
 			ID    int64 `json:"id"`
 			IsBot bool  `json:"is_bot"`
 		} `json:"from"`
@@ -186,6 +244,28 @@ type Update struct {
 			Type  string `json:"type"`
 		} `json:"chat"`
 	} `json:"message"`
+}
+
+// DownloadFile fetches a Telegram file by file_id (getFile + download through the
+// same proxied client). Returns the bytes and a best-effort filename.
+func (b *Bot) DownloadFile(fileID string) ([]byte, string, error) {
+	var res struct {
+		FilePath string `json:"file_path"`
+	}
+	if err := b.call("getFile", map[string]any{"file_id": fileID}, &res); err != nil {
+		return nil, "", err
+	}
+	resp, err := b.http.Get("https://api.telegram.org/file/bot" + b.token + "/" + res.FilePath)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	name := res.FilePath
+	if i := strings.LastIndexByte(name, '/'); i >= 0 {
+		name = name[i+1:]
+	}
+	return data, name, err
 }
 
 // GetUpdates long-polls for updates starting at offset.

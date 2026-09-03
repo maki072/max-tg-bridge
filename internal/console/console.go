@@ -1,4 +1,4 @@
-﻿package console
+package console
 
 import (
 	"bufio"
@@ -45,6 +45,13 @@ func Run(configPath string) {
 				fmt.Printf("Autostart setup failed: %v\n", err)
 			}
 		}
+	}
+
+	// Auto-start the bridge in the background as soon as the console opens —
+	// no need to remember to press "8" every time. startBridgeBackground is a
+	// no-op if a copy is already running (single-instance guard in main.go).
+	if cfg, err := config.LoadRaw(configPath); err == nil && cfg.Complete() {
+		startBridgeBackground(configPath)
 	}
 
 	for {
@@ -475,5 +482,3 @@ func idStr(n int64) string {
 	}
 	return strconv.FormatInt(n, 10)
 }
-
-

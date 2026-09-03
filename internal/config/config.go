@@ -41,6 +41,11 @@ type Config struct {
 	// message. 0 = rely on the structural heuristic only (recommended until
 	// the real opcode is confirmed during Step 2 discovery).
 	IncomingOpcode int `json:"incoming_opcode"`
+
+	// HistoryCount: how many recent messages to backfill into a topic when it is
+	// first created (0 = off). Kept modest by default — Telegram rate-limits and
+	// a large dump floods the topic.
+	HistoryCount int `json:"history_count"`
 }
 
 // Default values.
@@ -93,6 +98,15 @@ func load(path string) (*Config, error) {
 	// are treated as incoming messages (set a different value to override).
 	if cfg.IncomingOpcode == 0 {
 		cfg.IncomingOpcode = 128
+	}
+	if cfg.HistoryCount == 0 {
+		cfg.HistoryCount = 20 // sensible default; set a negative value to disable
+	}
+	if cfg.HistoryCount < 0 {
+		cfg.HistoryCount = 0
+	}
+	if cfg.HistoryCount > 200 {
+		cfg.HistoryCount = 200 // hard cap to avoid flooding / rate limits
 	}
 	return cfg, nil
 }

@@ -1,4 +1,4 @@
-﻿package bridge
+package bridge
 
 import (
 	"fmt"
@@ -34,11 +34,11 @@ type Bridge struct {
 
 func New(max *maxapi.Client, bot *tg.Bot, st *store.Store, cfg *config.Config, configPath string) *Bridge {
 	return &Bridge{
-		max:          max,
-		bot:          bot,
-		st:           st,
-		cfg:          cfg,
-		configPath:   configPath,
+		max:        max,
+		bot:        bot,
+		st:         st,
+		cfg:        cfg,
+		configPath: configPath,
 		// Buffered (size 1) so a code/captcha the admin sends a moment before the
 		// auth goroutine reaches its receive is queued instead of being dropped.
 		authCodeChan: make(chan string, 1),
@@ -79,13 +79,127 @@ func (b *Bridge) OnMaxMessage(m maxapi.IncomingMessage) {
 		}
 		threadID = id
 		b.st.SetTopic(chatKey, threadID)
+		b.onNewTopic(threadID, m.ChatID) // avatar + history backfill
 	}
 
-	text := fmt.Sprintf("%s:\n%s", m.SenderName, m.Text)
-	if err := b.bot.SendToTopic(threadID, text); err != nil {
-		log.Printf("[bridge] sendToTopic %d failed: %v", threadID, err)
-		b.notify(fmt.Sprintf("⚠️ Failed to deliver a MAX message to its topic: %v", err))
+	b.postMessage(threadID, m)
+}
+
+// postMessage renders one MAX message into a topic (header + text + media).
+func (b *Bridge) postMessage(threadID int, m maxapi.IncomingMessage) {
+	prefix := ""
+	if m.Outgoing {
+		prefix = "➡️ "
 	}
+	if m.Forwarded {
+		prefix += "↪ "
+	}
+	header := prefix + m.SenderName
+	if strings.TrimSpace(m.Text) != "" {
+		if err := b.bot.SendToTopic(threadID, header+":\n"+m.Text); err != nil {
+			log.Printf("[bridge] sendToTopic %d failed: %v", threadID, err)
+		}
+	}
+	for _, att := range m.Attachments {
+		b.forwardAttachment(threadID, header, att)
+	}
+}
+
+// onNewTopic posts the chat avatar and backfills recent history into a new topic.
+func (b *Bridge) onNewTopic(threadID int, chatID int64) {
+	if url := b.max.ChatIcon(chatID); url != "" {
+		b.forwardAttachment(threadID, "🖼", maxapi.Attachment{Kind: "photo", URL: url})
+	}
+	for _, hm := range b.max.History(chatID, b.cfg.HistoryCount) {
+		if hm.MessageID != "" && b.st.SeenAndMark("max:"+hm.MessageID) {
+			continue
+		}
+		b.postMessage(threadID, hm)
+	}
+}
+
+// forwardAttachment downloads a MAX media attachment and posts it into the topic.
+func (b *Bridge) forwardAttachment(threadID int, header string, att maxapi.Attachment) {
+	caption := header + ":"
+	switch att.Kind {
+	case "photo":
+		data, _, err := httpDownload(att.URL, 25*1024*1024)
+		if err != nil {
+			log.Printf("[bridge] photo download failed: %v", err)
+			_ = b.bot.SendToTopic(threadID, caption+" 🖼 "+att.URL)
+			return
+		}
+		// MAX photos are WebP; Telegram sendPhoto needs JPEG/PNG.
+		if jpg, err := webpToJPEG(data); err == nil {
+			data = jpg
+		}
+		if err := b.bot.SendPhoto(threadID, data, caption); err != nil {
+			log.Printf("[bridge] sendPhoto failed: %v; sending as document", err)
+			_ = b.bot.SendDocument(threadID, data, "photo.jpg", caption)
+		}
+	case "file":
+		data, _, err := httpDownload(att.URL, 45*1024*1024)
+		if err != nil {
+			log.Printf("[bridge] file download failed: %v", err)
+			_ = b.bot.SendToTopic(threadID, caption+" 📎 "+att.URL)
+			return
+		}
+		name := att.Name
+		if name == "" {
+			name = "file"
+		}
+		if err := b.bot.SendDocument(threadID, data, name, caption); err != nil {
+			log.Printf("[bridge] sendDocument failed: %v", err)
+		}
+	case "video":
+		// Videos use large signed CDN URLs — post the link (Telegram will preview it).
+		_ = b.bot.SendToTopic(threadID, caption+" 🎥 "+att.URL)
+	case "voice":
+		// MAX gives us no fetchable URL for voice notes (see toAttachments) —
+		// post a visible placeholder instead of silently dropping the message.
+		_ = b.bot.SendToTopic(threadID, fmt.Sprintf("%s 🎤 Голосовое сообщение (%s) — откройте MAX, чтобы прослушать", caption, formatDuration(att.Duration)))
+	case "poll":
+		text := caption + " 📊 Голосование"
+		if strings.TrimSpace(att.Text) != "" {
+			text += ": " + att.Text
+		}
+		text += " — откройте MAX, чтобы посмотреть варианты и проголосовать"
+		_ = b.bot.SendToTopic(threadID, text)
+	case "other":
+		label := att.Name
+		if label == "" {
+			label = "вложение"
+		}
+		_ = b.bot.SendToTopic(threadID, fmt.Sprintf("%s 📎 Неподдерживаемое вложение (%s) — откройте MAX, чтобы посмотреть", caption, label))
+	}
+}
+
+// formatDuration renders a millisecond duration as m:ss for voice notes.
+func formatDuration(ms int64) string {
+	total := ms / 1000
+	return fmt.Sprintf("%d:%02d", total/60, total%60)
+}
+
+// OnMaxReaction forwards a NOTIF_REACTION event into the mapped topic, if one
+// already exists for that chat (reactions never create a topic by themselves).
+func (b *Bridge) OnMaxReaction(r maxapi.IncomingReaction) {
+	if b.bot.GroupID() == 0 {
+		return
+	}
+	chatKey := strconv.FormatInt(r.ChatID, 10)
+	threadID, ok := b.st.Topic(chatKey)
+	if !ok {
+		return
+	}
+	if len(r.Counters) == 0 {
+		_ = b.bot.SendToTopic(threadID, "🔔 Реакции на сообщение сняты")
+		return
+	}
+	parts := make([]string, 0, len(r.Counters))
+	for _, c := range r.Counters {
+		parts = append(parts, fmt.Sprintf("%s x%d", c.Reaction, c.Count))
+	}
+	_ = b.bot.SendToTopic(threadID, "🔔 Реакция: "+strings.Join(parts, ", "))
 }
 
 func (b *Bridge) RunTelegram() {
@@ -154,51 +268,84 @@ func (b *Bridge) isAdmin(userID int64) bool {
 
 func (b *Bridge) handleUpdate(u tg.Update) {
 	msg := u.Message
-	if msg == nil || msg.Text == "" || msg.From.IsBot {
+	if msg == nil || msg.From.IsBot {
 		return
 	}
+	hasMedia := len(msg.Photo) > 0 || msg.Document != nil
 
-	// 1. Приватные сообщения боту (Личка) - только для Администраторов группы!
+	// 1. Приватные сообщения боту (Личка) — только для Администраторов группы!
 	if msg.Chat.Type == "private" {
 		if !b.isAdmin(msg.From.ID) {
 			_ = b.bot.SendMenu(msg.Chat.ID, "У вас нет прав администратора в привязанной группе MAX-TG.", tg.ReplyKeyboardMarkup{ResizeKeyboard: true})
 			return
 		}
-		b.handleAdminPM(msg.Chat.ID, msg.Text)
+		if msg.Text != "" {
+			b.handleAdminPM(msg.Chat.ID, msg.Text)
+		}
 		return
 	}
 
 	// 2. Действия внутри привязанной супергруппы
-	if b.bot.GroupID() != 0 && msg.Chat.ID == b.bot.GroupID() {
-		// General topic
-		if msg.MessageThreadID == 0 {
-			if strings.HasPrefix(msg.Text, "/") {
-				// Оставим базовые команды в General на всякий случай
-				if reply := b.processCommand(msg.Text); reply != "" {
-					b.notify(reply)
-				}
+	if b.bot.GroupID() == 0 || msg.Chat.ID != b.bot.GroupID() {
+		return
+	}
+	// General topic — только базовые команды.
+	if msg.MessageThreadID == 0 {
+		if strings.HasPrefix(msg.Text, "/") {
+			if reply := b.processCommand(msg.Text); reply != "" {
+				b.notify(reply)
 			}
-			return
 		}
+		return
+	}
 
-		// A named topic: forward the reply to the MAX chat it's mapped to.
-		chatKey, ok := b.st.ChatByTopic(msg.MessageThreadID)
-		if !ok {
-			return
+	// A named topic: forward the reply (text or media) to the mapped MAX chat.
+	if msg.Text == "" && !hasMedia {
+		return
+	}
+	chatKey, ok := b.st.ChatByTopic(msg.MessageThreadID)
+	if !ok {
+		return
+	}
+	chatID, err := strconv.ParseInt(chatKey, 10, 64)
+	if err != nil {
+		return
+	}
+
+	if hasMedia {
+		var fileID, name string
+		if msg.Document != nil {
+			fileID, name = msg.Document.FileID, msg.Document.FileName
+		} else {
+			fileID, name = msg.Photo[len(msg.Photo)-1].FileID, "photo.jpg" // largest size
 		}
-		chatID, err := strconv.ParseInt(chatKey, 10, 64)
+		data, dlName, err := b.bot.DownloadFile(fileID)
 		if err != nil {
+			log.Printf("[bridge] TG file download failed: %v", err)
 			return
 		}
-		if err := b.max.SendMessage(chatID, msg.Text); err != nil {
-			log.Printf("[bridge] MAX send to chat %d failed: %v", chatID, err)
+		if name == "" {
+			name = dlName
 		}
+		if id, err := b.max.SendFile(chatID, name, data, msg.Caption); err != nil {
+			log.Printf("[bridge] MAX SendFile to chat %d failed: %v", chatID, err)
+		} else if id != "" {
+			b.st.SeenAndMark("max:" + id)
+		}
+		return
+	}
+
+	msgID, err := b.max.SendMessage(chatID, msg.Text)
+	if err != nil {
+		log.Printf("[bridge] MAX send to chat %d failed: %v", chatID, err)
+	} else if msgID != "" {
+		b.st.SeenAndMark("max:" + msgID) // skip our own echo
 	}
 }
 
 func (b *Bridge) handleAdminPM(chatID int64, text string) {
 	cmd := strings.TrimSpace(text)
-	
+
 	menu := tg.ReplyKeyboardMarkup{
 		Keyboard: [][]tg.KeyboardButton{
 			{{Text: "📊 Статус"}, {Text: "🔄 Перезапустить"}},
@@ -240,7 +387,7 @@ func (b *Bridge) handleAdminPM(chatID int64, text string) {
 	if reply == "" {
 		reply = "Выберите действие в графическом меню управления мостом MAX-TG 👇"
 	}
-	
+
 	_ = b.bot.SendMenu(chatID, reply, menu)
 }
 
@@ -250,7 +397,7 @@ func (b *Bridge) processCommand(text string) string {
 		return ""
 	}
 	cmd := strings.ToLower(fields[0])
-	
+
 	// Strip a "@botname" suffix if present
 	if i := strings.Index(cmd, "@"); i >= 0 {
 		cmd = cmd[:i]
@@ -261,12 +408,12 @@ func (b *Bridge) processCommand(text string) string {
 		return "Добро пожаловать в панель управления мостом MAX-TG!"
 	case "/status", "/ping":
 		connected, selfID, lastErr := b.max.Status()
-		
+
 		s := "🔴 MAX: Отключен"
 		if connected {
 			s = fmt.Sprintf("🟢 MAX: Подключен (ID: %d)", selfID)
 		}
-		
+
 		var sb strings.Builder
 		sb.WriteString(s + "\n")
 		if lastErr != "" {
@@ -282,7 +429,9 @@ func (b *Bridge) processCommand(text string) string {
 				n = v
 			}
 		}
-		if n > 200 { n = 200 }
+		if n > 200 {
+			n = 200
+		}
 		return b.tailLog(n)
 
 	case "/auth":
@@ -489,8 +638,3 @@ func (b *Bridge) tailLog(n int) string {
 	}
 	return out
 }
-
-
-
-
-
