@@ -1,4 +1,4 @@
-﻿package tg
+package tg
 
 import (
 	"bytes"
@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"mime/multipart"
 	"net"
 	"net/http"
@@ -31,33 +32,43 @@ func (b *Bot) SendDocument(threadID int, doc []byte, filename, caption string) e
 	return b.sendMedia("sendDocument", "document", filename, doc, threadID, caption)
 }
 
-// sendMedia posts a multipart file upload to the group/topic.
+// sendMedia posts a multipart file upload to the group/topic, throttled and
+// retried the same way as call() (see doRequest) — a burst of photos/files
+// (e.g. topic history backfill) hitting Telegram's per-chat rate limit used to
+// make every single send fail with 429 and fall straight to the sendDocument
+// fallback, which then also 429'd. Retrying in place fixes that instead of
+// doubling the failed calls.
 func (b *Bot) sendMedia(method, field, filename string, data []byte, threadID int, caption string) error {
-	var buf bytes.Buffer
-	w := multipart.NewWriter(&buf)
-	_ = w.WriteField("chat_id", strconv.FormatInt(b.GroupID(), 10))
-	if threadID != 0 {
-		_ = w.WriteField("message_thread_id", strconv.Itoa(threadID))
-	}
-	if caption != "" {
-		_ = w.WriteField("caption", caption)
-	}
-	fw, err := w.CreateFormFile(field, filename)
+	body, err := b.doRequest(func() (*http.Request, error) {
+		var buf bytes.Buffer
+		w := multipart.NewWriter(&buf)
+		_ = w.WriteField("chat_id", strconv.FormatInt(b.GroupID(), 10))
+		if threadID != 0 {
+			_ = w.WriteField("message_thread_id", strconv.Itoa(threadID))
+		}
+		if caption != "" {
+			_ = w.WriteField("caption", caption)
+		}
+		fw, err := w.CreateFormFile(field, filename)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := fw.Write(data); err != nil {
+			return nil, err
+		}
+		if err := w.Close(); err != nil {
+			return nil, err
+		}
+		req, err := http.NewRequest(http.MethodPost, b.base+"/"+method, &buf)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", w.FormDataContentType())
+		return req, nil
+	})
 	if err != nil {
 		return err
 	}
-	if _, err := fw.Write(data); err != nil {
-		return err
-	}
-	if err := w.Close(); err != nil {
-		return err
-	}
-	resp, err := b.http.Post(b.base+"/"+method, w.FormDataContentType(), &buf)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
 	var ar apiResp
 	if json.Unmarshal(body, &ar) == nil && !ar.OK {
 		return fmt.Errorf("%s: %s", method, ar.Description)
@@ -73,6 +84,96 @@ type Bot struct {
 
 	mu      sync.RWMutex
 	groupID int64
+
+	// rateMu/nextSend throttle every outgoing call (sendMessage/sendPhoto/...)
+	// to a shared minimum interval — Telegram allows roughly one message per
+	// second per chat, and this bridge fans out from several goroutines
+	// (incoming MAX messages, reactions, command replies) into the SAME group,
+	// so without a shared gate a burst (e.g. backfilling a new topic's history)
+	// blows straight through the limit and every send in the burst 429s.
+	rateMu   sync.Mutex
+	nextSend time.Time
+}
+
+// tgMinInterval keeps sends to the group comfortably under Telegram's ~1
+// message/second per-chat limit even with several goroutines sending at once.
+const tgMinInterval = 1100 * time.Millisecond
+
+// tgMaxRetries is how many additional attempts doRequest makes after a 429
+// before giving up and returning the error to the caller.
+const tgMaxRetries = 5
+
+// throttle blocks until the shared minimum interval since the last send has
+// elapsed, then reserves the next slot. Call this immediately before every
+// outgoing HTTP request to Telegram.
+func (b *Bot) throttle() {
+	b.rateMu.Lock()
+	defer b.rateMu.Unlock()
+	if wait := time.Until(b.nextSend); wait > 0 {
+		time.Sleep(wait)
+	}
+	b.nextSend = time.Now().Add(tgMinInterval)
+}
+
+// retryParams mirrors Telegram's 429 "parameters" object.
+type retryParams struct {
+	RetryAfter int `json:"retry_after"`
+}
+
+// retryAfterWait picks how long to sleep before retrying a 429, preferring
+// the structured "parameters.retry_after" field and falling back to parsing
+// it out of the description text ("... retry after 34") if that's absent.
+func retryAfterWait(p *retryParams, description string) time.Duration {
+	secs := 0
+	if p != nil && p.RetryAfter > 0 {
+		secs = p.RetryAfter
+	} else if i := strings.Index(description, "retry after "); i >= 0 {
+		fmt.Sscanf(description[i+len("retry after "):], "%d", &secs)
+	}
+	if secs <= 0 {
+		secs = 5
+	}
+	// Telegram's countdown is to-the-second; pad slightly so we don't re-knock
+	// right on the boundary and get told to wait again.
+	return time.Duration(secs)*time.Second + 500*time.Millisecond
+}
+
+// doRequest throttles, builds (via newReq, called fresh on every attempt since
+// a request body can only be read once), sends, and — on a 429 — sleeps for
+// the server-given retry_after and tries again, up to tgMaxRetries times.
+// Returns the raw response body on any non-429 response (including other
+// Telegram-level errors, which the caller decodes from the body itself).
+func (b *Bot) doRequest(newReq func() (*http.Request, error)) ([]byte, error) {
+	var lastErr error
+	for attempt := 0; attempt <= tgMaxRetries; attempt++ {
+		b.throttle()
+		req, err := newReq()
+		if err != nil {
+			return nil, err
+		}
+		resp, err := b.http.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		data, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		var probe struct {
+			OK          bool         `json:"ok"`
+			ErrorCode   int          `json:"error_code"`
+			Description string       `json:"description"`
+			Parameters  *retryParams `json:"parameters"`
+		}
+		if json.Unmarshal(data, &probe) == nil && !probe.OK && probe.ErrorCode == 429 && attempt < tgMaxRetries {
+			wait := retryAfterWait(probe.Parameters, probe.Description)
+			log.Printf("[tg] rate-limited (429), waiting %v before retry %d/%d", wait, attempt+1, tgMaxRetries)
+			lastErr = fmt.Errorf("telegram error 429: %s", probe.Description)
+			time.Sleep(wait)
+			continue
+		}
+		return data, nil
+	}
+	return nil, lastErr
 }
 
 // New creates a Bot for a given supergroup. proxyURL, if non-empty, routes all
@@ -143,17 +244,23 @@ type apiResp struct {
 }
 
 // call performs a POST with a JSON body and decodes result into out.
+// Throttled and auto-retried on 429 via doRequest.
 func (b *Bot) call(method string, body any, out any) error {
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return err
 	}
-	resp, err := b.http.Post(b.base+"/"+method, "application/json", bytes.NewReader(raw))
+	data, err := b.doRequest(func() (*http.Request, error) {
+		req, err := http.NewRequest(http.MethodPost, b.base+"/"+method, bytes.NewReader(raw))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		return req, nil
+	})
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
 
 	var ar apiResp
 	if err := json.Unmarshal(data, &ar); err != nil {
