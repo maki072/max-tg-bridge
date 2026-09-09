@@ -89,6 +89,14 @@ func (p *Program) run() {
 			}()
 			br.OnMaxReaction(r)
 		},
+		OnDelete: func(d maxapi.IncomingDelete) {
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Printf("[app] recovered from panic handling MAX delete: %v", rec)
+				}
+			}()
+			br.OnMaxDelete(d)
+		},
 		SaveToken: func(d, t, ua, ck string) { st.SetCredentials(d, t, ua, ck) },
 		LoadToken: func() (string, string, string) { d, t, _, ck := st.GetCredentials(); return d, t, ck },
 		Refresh:   refresh,

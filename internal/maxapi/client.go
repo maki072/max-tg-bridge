@@ -3,6 +3,7 @@ package maxapi
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +11,8 @@ import (
 	"mime/multipart"
 	"net"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -185,6 +188,7 @@ type Client struct {
 
 	onMessage  func(IncomingMessage)
 	onReaction func(IncomingReaction)
+	onDelete   func(IncomingDelete)
 	saveToken  func(deviceID, token, userAgent, cookie string)
 	loadToken  func() (deviceID, token, cookie string)
 	readCode   func() string
@@ -193,6 +197,7 @@ type Client struct {
 
 	deliver     chan IncomingMessage  // decouples delivery (+ MAX lookups) from readLoop
 	reactions   chan IncomingReaction // decouples reaction delivery from readLoop
+	deletes     chan IncomingDelete   // decouples delete-event delivery from readLoop
 	attachReady chan struct{}         // signalled on NOTIF_ATTACH (opcode 136)
 
 	debugMu  sync.Mutex
@@ -210,6 +215,7 @@ type Options struct {
 	AllowSMS    bool
 	OnMessage   func(IncomingMessage)
 	OnReaction  func(IncomingReaction)
+	OnDelete    func(IncomingDelete)
 	SaveToken   func(deviceID, token, userAgent, cookie string)
 	LoadToken   func() (deviceID, token, cookie string)
 	ReadSMSCode func() string
@@ -233,9 +239,11 @@ func New(o Options) *Client {
 		userName:    make(map[int64]string),
 		deliver:     make(chan IncomingMessage, 256),
 		reactions:   make(chan IncomingReaction, 256),
+		deletes:     make(chan IncomingDelete, 256),
 		attachReady: make(chan struct{}, 1),
 		onMessage:   o.OnMessage,
 		onReaction:  o.OnReaction,
+		onDelete:    o.OnDelete,
 		saveToken:   o.SaveToken,
 		loadToken:   o.LoadToken,
 		readCode:    o.ReadSMSCode,
@@ -247,6 +255,7 @@ func New(o Options) *Client {
 func (c *Client) Run() {
 	go c.deliverLoop()
 	go c.reactionLoop()
+	go c.deleteLoop()
 	attempt := 0
 	for {
 		start := time.Now()
@@ -622,20 +631,15 @@ func (c *Client) History(chatID int64, count int) []IncomingMessage {
 		return nil
 	}
 	var r struct {
-		Messages []struct {
-			ID       json.Number `json:"id"`
-			Text     string      `json:"text"`
-			Sender   json.Number `json:"sender"`
-			Attaches []attach    `json:"attaches"`
-		} `json:"messages"`
+		Messages []msgBody `json:"messages"`
 	}
 	if json.Unmarshal(resp.Payload, &r) != nil {
 		return nil
 	}
 	out := make([]IncomingMessage, 0, len(r.Messages))
 	for _, m := range r.Messages {
-		att := toAttachments(m.Attaches)
-		if strings.TrimSpace(m.Text) == "" && len(att) == 0 {
+		text, att, forwarded, replyToID := parseLink(m.Link, m.Text, toAttachments(m.Attaches))
+		if strings.TrimSpace(text) == "" && len(att) == 0 {
 			continue
 		}
 		sid := numToInt64(m.Sender)
@@ -643,10 +647,13 @@ func (c *Client) History(chatID int64, count int) []IncomingMessage {
 			MessageID:   m.ID.String(),
 			ChatID:      chatID,
 			SenderID:    sid,
-			Text:        m.Text,
+			Text:        text,
 			Attachments: att,
 			Outgoing:    sid != 0 && sid == c.selfID,
+			Forwarded:   forwarded,
+			ReplyToID:   replyToID,
 		}
+		c.resolveAttachments(chatID, im.MessageID, im.Attachments)
 		c.enrich(&im)
 		out = append(out, im)
 	}
@@ -660,6 +667,12 @@ func (c *Client) History(chatID int64, count int) []IncomingMessage {
 // SendFile uploads a file to MAX storage and posts it as a message attachment.
 // Returns the created message id (for echo dedupe).
 func (c *Client) SendFile(chatID int64, name string, data []byte, caption string) (string, error) {
+	return c.SendFileReply(chatID, name, data, caption, "")
+}
+
+// SendFileReply is SendFile, optionally posted as a reply to an existing MAX
+// message (replyToMaxID == "" means no reply link).
+func (c *Client) SendFileReply(chatID int64, name string, data []byte, caption string, replyToMaxID string) (string, error) {
 	if name == "" {
 		name = "file"
 	}
@@ -699,32 +712,346 @@ func (c *Client) SendFile(chatID int64, name string, data []byte, caption string
 	case <-time.After(15 * time.Second):
 		// proceed anyway; some uploads don't emit a push
 	}
-	cid := time.Now().UnixNano()
-	sr, err := c.request(OpMsgSend, map[string]any{
-		"chatId": chatID,
-		"message": map[string]any{
-			"text":     caption,
-			"cid":      cid,
-			"elements": []any{},
-			"attaches": []map[string]any{{
-				"_type": "FILE", "fileId": slot.FileID, "token": slot.Token,
-				"name": name, "size": len(data),
-			}},
-		},
-		"notify": true,
+	return c.sendAttachMessage(chatID, caption, replyToMaxID, map[string]any{
+		"_type": "FILE", "fileId": slot.FileID, "token": slot.Token,
+		"name": name, "size": len(data),
+	})
+}
+
+// uploadSlot is the common {url, id, token} shape returned by the
+// PHOTO/VIDEO/FILE upload opcodes (the id field name varies by type).
+type uploadSlot struct {
+	URL   string
+	ID    int64
+	Token string
+}
+
+// parseUploadSlot decodes the {"info":[{"url":...,"videoId"|"fileId":N,"token":...}]}
+// response shape shared by the VIDEO_UPLOAD/FILE_UPLOAD opcodes.
+func parseUploadSlot(payload json.RawMessage) (uploadSlot, error) {
+	var up struct {
+		Info []struct {
+			URL     string      `json:"url"`
+			VideoID json.Number `json:"videoId"`
+			FileID  json.Number `json:"fileId"`
+			Token   string      `json:"token"`
+		} `json:"info"`
+	}
+	if json.Unmarshal(payload, &up) != nil || len(up.Info) == 0 {
+		return uploadSlot{}, fmt.Errorf("no upload slot in response: %s", string(payload))
+	}
+	s := up.Info[0]
+	id := numToInt64(s.VideoID)
+	if id == 0 {
+		id = numToInt64(s.FileID)
+	}
+	return uploadSlot{URL: s.URL, ID: id, Token: s.Token}, nil
+}
+
+// photoIDFromUploadURL extracts the "photoIds" query parameter MAX embeds in
+// the PHOTO_UPLOAD (opcode 80) response URL — the HTTP upload response later
+// keys its token map by this same id.
+func photoIDFromUploadURL(rawURL string) (string, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", err
+	}
+	ids := u.Query()["photoIds"]
+	if len(ids) == 0 || ids[0] == "" {
+		return "", fmt.Errorf("upload url has no photoIds query param: %s", rawURL)
+	}
+	return ids[0], nil
+}
+
+// SendPhoto uploads a photo to MAX via the dedicated photo-upload flow
+// (opcode 80: request an upload slot -> HTTP multipart POST -> the HTTP
+// response body itself, not a socket push, carries the photo token) and posts
+// it as a PHOTO attachment — unlike SendFile's generic FILE attach, this
+// shows up inline like a real photo, matching the web/mobile clients.
+func (c *Client) SendPhoto(chatID int64, data []byte, caption string, replyToMaxID string) (string, error) {
+	resp, err := c.request(OpImageUploadURL, map[string]any{
+		"count": 1, "type": 0, "uploaderType": 0, "profile": false,
+	}, 15*time.Second)
+	if err != nil {
+		return "", err
+	}
+	var up struct {
+		URL string `json:"url"`
+	}
+	if json.Unmarshal(resp.Payload, &up) != nil || up.URL == "" {
+		return "", fmt.Errorf("no upload url in PHOTO_UPLOAD response: %s", string(resp.Payload))
+	}
+	photoID, err := photoIDFromUploadURL(up.URL)
+	if err != nil {
+		return "", err
+	}
+	token, err := httpUploadPhoto(up.URL, data, photoID)
+	if err != nil {
+		return "", err
+	}
+	return c.sendAttachMessage(chatID, caption, replyToMaxID, map[string]any{
+		"_type": "PHOTO", "photoToken": token,
+	})
+}
+
+// SendVideo uploads a video to MAX via VIDEO_UPLOAD (opcode 82, type=0) and
+// posts it as a VIDEO attachment. Like SendFile, the server confirms the
+// upload asynchronously via NOTIF_ATTACH (opcode 136) — reuses attachReady.
+func (c *Client) SendVideo(chatID int64, name string, data []byte, caption string, replyToMaxID string) (string, error) {
+	resp, err := c.request(OpVideoUpload, map[string]any{
+		"count": 1, "type": 0, "uploaderType": 0, "profile": false,
+	}, 15*time.Second)
+	if err != nil {
+		return "", err
+	}
+	slot, err := parseUploadSlot(resp.Payload)
+	if err != nil {
+		return "", err
+	}
+	select {
+	case <-c.attachReady:
+	default:
+	}
+	if err := httpUploadRaw(slot.URL, name, data, ""); err != nil {
+		return "", err
+	}
+	select {
+	case <-c.attachReady:
+	case <-time.After(30 * time.Second):
+		// proceed anyway; matches SendFile's tolerant behavior
+	}
+	return c.sendAttachMessage(chatID, caption, replyToMaxID, map[string]any{
+		"_type": "VIDEO", "videoId": slot.ID, "token": slot.Token, "videoType": 0,
+	})
+}
+
+// SendVoice uploads a voice note to MAX via VIDEO_UPLOAD (opcode 82, type=2,
+// uploaderType=1) and posts it as an AUDIO attachment. Telegram voice notes
+// are already OGG/Opus — the only format MAX's own client accepts — so no
+// transcoding is needed. Unlike video, MAX attaches a voice note right after
+// the HTTP upload with no NOTIF_ATTACH wait (matches the reference client).
+func (c *Client) SendVoice(chatID int64, data []byte, durationMS int64, caption string, replyToMaxID string) (string, error) {
+	resp, err := c.request(OpVideoUpload, map[string]any{
+		"count": 1, "type": 2, "uploaderType": 1, "profile": false,
+	}, 15*time.Second)
+	if err != nil {
+		return "", err
+	}
+	slot, err := parseUploadSlot(resp.Payload)
+	if err != nil {
+		return "", err
+	}
+	if err := httpUploadRaw(slot.URL, "voice.ogg", data, "application/octet-stream"); err != nil {
+		return "", err
+	}
+	// "wave" is a waveform preview the real client always attaches; MAX does
+	// not appear to validate its content, so a fixed all-zero placeholder
+	// (matching what other reverse-engineered clients send when they have no
+	// real waveform data) is used rather than computing one.
+	wave := base64.StdEncoding.EncodeToString(make([]byte, 80))
+	return c.sendAttachMessage(chatID, caption, replyToMaxID, map[string]any{
+		"_type": "AUDIO", "token": slot.Token, "duration": durationMS, "wave": wave,
+	})
+}
+
+// sendAttachMessage posts a single-attachment message (photo/video/voice/file)
+// via MSG_SEND, optionally as a reply, and returns the created message id.
+func (c *Client) sendAttachMessage(chatID int64, caption, replyToMaxID string, attach map[string]any) (string, error) {
+	msg := map[string]any{
+		"text": caption, "cid": time.Now().UnixNano(), "elements": []any{},
+		"attaches": []map[string]any{attach},
+	}
+	if replyToMaxID != "" {
+		msg["link"] = map[string]any{"type": "REPLY", "messageId": msgIDArg(replyToMaxID)}
+	}
+	resp, err := c.request(OpMsgSend, map[string]any{
+		"chatId": chatID, "message": msg, "notify": true,
 	}, 20*time.Second)
 	if err != nil {
 		return "", err
 	}
-	var mr struct {
+	var r struct {
 		Message struct {
 			ID json.Number `json:"id"`
 		} `json:"message"`
 	}
-	if json.Unmarshal(sr.Payload, &mr) == nil {
-		return mr.Message.ID.String(), nil
+	if json.Unmarshal(resp.Payload, &r) == nil && r.Message.ID != "" {
+		return r.Message.ID.String(), nil
 	}
 	return "", nil
+}
+
+// msgIDArg encodes a MAX message id for a request payload as a JSON number
+// when possible (most opcodes — reactions, edit, delete, reply links —
+// declare message_id as a strict int on the wire) and falls back to the raw
+// string only if it isn't numeric.
+func msgIDArg(id string) any {
+	if n, err := strconv.ParseInt(id, 10, 64); err == nil {
+		return n
+	}
+	return id
+}
+
+// resolveAttachments fills in URL for any attachment that only carries a lazy
+// Resolve* id (a VIDEO/FILE/AUDIO attach MAX sent without a direct URL). MUST
+// be called off the read loop — it makes MAX requests and blocks for replies.
+func (c *Client) resolveAttachments(chatID int64, messageID string, atts []Attachment) {
+	for i := range atts {
+		if atts[i].URL != "" || atts[i].ResolveKind == "" {
+			continue
+		}
+		var resolved string
+		switch atts[i].ResolveKind {
+		case "video":
+			resolved = c.getVideoURL(chatID, messageID, atts[i].ResolveID)
+		case "file":
+			resolved = c.getFileURL(chatID, messageID, atts[i].ResolveID)
+		case "audio":
+			resolved = c.getAudioURL(chatID, messageID, atts[i].ResolveID)
+		}
+		if resolved != "" {
+			atts[i].URL = resolved
+		}
+	}
+}
+
+// getVideoURL resolves a playable URL for a VIDEO attach via VIDEO_PLAY
+// (opcode 83). Mirrors the confirmed client behavior: prefer the
+// highest-numbered "MP4_<n>" key, fall back to dynamicUrl/dynamic_url, then
+// EXTERNAL (a web-player link — still useful as an "open to watch" fallback).
+func (c *Client) getVideoURL(chatID int64, messageID string, videoID int64) string {
+	resp, err := c.request(OpVideoPlay, map[string]any{
+		"chatId": chatID, "messageId": msgIDArg(messageID), "videoId": videoID,
+	}, 15*time.Second)
+	if err != nil {
+		log.Printf("[max] VIDEO_PLAY failed for videoId=%d: %v", videoID, err)
+		return ""
+	}
+	var r map[string]any
+	if json.Unmarshal(resp.Payload, &r) != nil {
+		return ""
+	}
+	bestQuality, bestURL := -1, ""
+	for k, v := range r {
+		s, ok := v.(string)
+		if !ok || s == "" {
+			continue
+		}
+		up := strings.ToUpper(k)
+		if !strings.HasPrefix(up, "MP4_") {
+			continue
+		}
+		q, err := strconv.Atoi(strings.TrimPrefix(up, "MP4_"))
+		if err != nil || q <= bestQuality {
+			continue
+		}
+		bestQuality, bestURL = q, s
+	}
+	if bestURL != "" {
+		return bestURL
+	}
+	for _, key := range []string{"dynamicUrl", "dynamic_url", "EXTERNAL"} {
+		if v, ok := r[key].(string); ok && v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// getFileURL resolves a temporary download URL for a FILE attach via
+// FILE_DOWNLOAD (opcode 88): {chatId,messageId,fileId} -> {url,unsafe}.
+func (c *Client) getFileURL(chatID int64, messageID string, fileID int64) string {
+	resp, err := c.request(OpFileDownload, map[string]any{
+		"chatId": chatID, "messageId": msgIDArg(messageID), "fileId": fileID,
+	}, 15*time.Second)
+	if err != nil {
+		log.Printf("[max] FILE_DOWNLOAD failed for fileId=%d: %v", fileID, err)
+		return ""
+	}
+	var r struct {
+		URL string `json:"url"`
+	}
+	if json.Unmarshal(resp.Payload, &r) != nil {
+		return ""
+	}
+	return r.URL
+}
+
+// getAudioURL is a best-effort attempt to resolve a voice-note URL via
+// AUDIO_PLAY (opcode 301). This opcode is confirmed to exist in the
+// reverse-engineered opcode table, but its request/response shape is NOT
+// documented anywhere and no known client actually calls it. This mirrors the
+// well-confirmed VIDEO_PLAY/FILE_DOWNLOAD request shape
+// ({chatId,messageId,audioId}) and accepts a flat {"url":...} response or the
+// MP4_*/EXTERNAL shape VIDEO_PLAY uses, in case the server treats audio the
+// same way. If the server rejects the opcode or returns nothing usable, the
+// raw response is logged so a real sample can be captured to fix this.
+func (c *Client) getAudioURL(chatID int64, messageID string, audioID int64) string {
+	resp, err := c.request(OpAudioPlay, map[string]any{
+		"chatId": chatID, "messageId": msgIDArg(messageID), "audioId": audioID,
+	}, 15*time.Second)
+	if err != nil {
+		log.Printf("[max] AUDIO_PLAY (best-effort) failed for audioId=%d: %v", audioID, err)
+		return ""
+	}
+	var r map[string]any
+	if json.Unmarshal(resp.Payload, &r) != nil {
+		return ""
+	}
+	for _, key := range []string{"url", "URL"} {
+		if v, ok := r[key].(string); ok && v != "" {
+			return v
+		}
+	}
+	for k, v := range r {
+		if strings.HasPrefix(strings.ToUpper(k), "MP4_") {
+			if s, ok := v.(string); ok && s != "" {
+				return s
+			}
+		}
+	}
+	if v, ok := r["EXTERNAL"].(string); ok && v != "" {
+		return v
+	}
+	log.Printf("[max] AUDIO_PLAY (best-effort) returned no usable URL for audioId=%d, raw=%s", audioID, string(resp.Payload))
+	return ""
+}
+
+// AddReaction sets/replaces our reaction on a message via MSG_REACTION
+// (opcode 178).
+func (c *Client) AddReaction(chatID int64, messageID string, reaction string) error {
+	_, err := c.request(OpMsgReaction, map[string]any{
+		"chatId": chatID, "messageId": msgIDArg(messageID),
+		"reaction": map[string]any{"reactionType": "EMOJI", "id": reaction},
+	}, 15*time.Second)
+	return err
+}
+
+// RemoveReaction removes our reaction via MSG_CANCEL_REACTION (opcode 179).
+func (c *Client) RemoveReaction(chatID int64, messageID string) error {
+	_, err := c.request(OpMsgCancelReaction, map[string]any{
+		"chatId": chatID, "messageId": msgIDArg(messageID),
+	}, 15*time.Second)
+	return err
+}
+
+// EditMessage edits the text of our own MAX message via MSG_EDIT (opcode 67).
+func (c *Client) EditMessage(chatID int64, messageID string, text string) error {
+	_, err := c.request(OpMsgEdit, map[string]any{
+		"chatId": chatID, "messageId": msgIDArg(messageID),
+		"text": text, "elements": []any{}, "attachments": []any{},
+	}, 15*time.Second)
+	return err
+}
+
+// DeleteMessage deletes a message via MSG_DELETE (opcode 66). forMe=false
+// deletes it for everyone (requires it being our own message or admin rights
+// in the chat — MAX, like any messenger, rejects deleting others' messages).
+func (c *Client) DeleteMessage(chatID int64, messageID string, forMe bool) error {
+	_, err := c.request(OpMsgDelete, map[string]any{
+		"chatId": chatID, "messageIds": []any{msgIDArg(messageID)}, "forMe": forMe,
+	}, 15*time.Second)
+	return err
 }
 
 // httpUpload POSTs a file to a MAX storage URL via multipart/form-data.
@@ -747,6 +1074,92 @@ func httpUpload(url, name string, data []byte) error {
 	}
 	req.Header.Set("Content-Type", w.FormDataContentType())
 	client := &http.Client{Timeout: 90 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("upload http %d: %s", resp.StatusCode, string(b))
+	}
+	return nil
+}
+
+// httpUploadPhoto POSTs photo bytes to a MAX PHOTO_UPLOAD URL (multipart,
+// field "file") and returns the token MAX assigns, read from the JSON BODY of
+// this same HTTP response (unlike SendFile's generic upload, the photo token
+// never arrives via a websocket push).
+func httpUploadPhoto(uploadURL string, data []byte, photoID string) (string, error) {
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	fw, err := w.CreateFormFile("file", "image.jpg")
+	if err != nil {
+		return "", err
+	}
+	if _, err := fw.Write(data); err != nil {
+		return "", err
+	}
+	if err := w.Close(); err != nil {
+		return "", err
+	}
+	req, err := http.NewRequest("POST", uploadURL, &buf)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	client := &http.Client{Timeout: 90 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("photo upload http %d: %s", resp.StatusCode, string(body))
+	}
+	var pr struct {
+		Photos map[string]struct {
+			Token string `json:"token"`
+		} `json:"photos"`
+	}
+	if err := json.Unmarshal(body, &pr); err != nil {
+		return "", fmt.Errorf("photo upload: bad response json: %s", string(body))
+	}
+	if p, ok := pr.Photos[photoID]; ok && p.Token != "" {
+		return p.Token, nil
+	}
+	// A response keyed by an id that doesn't exactly match the upload URL's
+	// photoIds value would be surprising, but fall back to any token present
+	// rather than failing outright.
+	for _, p := range pr.Photos {
+		if p.Token != "" {
+			return p.Token, nil
+		}
+	}
+	return "", fmt.Errorf("photo upload response has no token: %s", string(body))
+}
+
+// httpUploadRaw POSTs raw bytes (not multipart) to a MAX VIDEO_UPLOAD slot
+// URL with a Content-Range header spanning the whole file in one shot,
+// matching the reference client's behavior for video/voice uploads.
+// contentType, if non-empty, overrides the default octet-stream.
+func httpUploadRaw(uploadURL, name string, data []byte, contentType string) error {
+	if len(data) == 0 {
+		return fmt.Errorf("empty upload body")
+	}
+	req, err := http.NewRequest("POST", uploadURL, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, name))
+	req.Header.Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", len(data)-1, len(data)))
+	req.Header.Set("Content-Length", strconv.Itoa(len(data)))
+	client := &http.Client{Timeout: 5 * time.Minute}
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
@@ -784,18 +1197,23 @@ func (c *Client) fetchUserName(userID int64) string {
 }
 
 func (c *Client) SendMessage(chatID int64, text string) (string, error) {
+	return c.SendMessageReply(chatID, text, "")
+}
+
+// SendMessageReply sends a text message, optionally as a reply to an
+// existing MAX message in the same chat (replyToMaxID == "" means no reply
+// link — behaves exactly like SendMessage).
+func (c *Client) SendMessageReply(chatID int64, text string, replyToMaxID string) (string, error) {
 	// MAX expects the message wrapped: {chatId, message:{text,cid,elements,attaches}, notify}
 	// (matches the web client / MaxBridge). A flat {text} payload is ignored.
-	cid := time.Now().UnixNano()
+	msg := map[string]any{
+		"text": text, "cid": time.Now().UnixNano(), "elements": []any{}, "attaches": []any{},
+	}
+	if replyToMaxID != "" {
+		msg["link"] = map[string]any{"type": "REPLY", "messageId": msgIDArg(replyToMaxID)}
+	}
 	resp, err := c.request(OpMsgSend, map[string]any{
-		"chatId": chatID,
-		"message": map[string]any{
-			"text":     text,
-			"cid":      cid,
-			"elements": []any{},
-			"attaches": []any{},
-		},
-		"notify": true,
+		"chatId": chatID, "message": msg, "notify": true,
 	}, 15*time.Second)
 	if err != nil {
 		return "", err
@@ -905,6 +1323,10 @@ func (c *Client) handlePush(f Frame) {
 		c.tryReaction(f)
 		return
 	}
+	if f.Opcode == OpPushMsgDelete { // a message was deleted
+		c.tryDelete(f)
+		return
+	}
 	if c.tryMessage(f) {
 		return
 	}
@@ -928,17 +1350,7 @@ func (c *Client) tryMessage(f Frame) bool {
 	if pm.Message == nil {
 		return false
 	}
-	text := pm.Message.Text
-	attachments := toAttachments(pm.Message.Attaches)
-	forwarded := false
-	// Forwarded messages nest the real content under link.message.
-	if strings.TrimSpace(text) == "" && len(attachments) == 0 &&
-		pm.Message.Link != nil && pm.Message.Link.Message != nil {
-		inner := pm.Message.Link.Message
-		text = inner.Text
-		attachments = toAttachments(inner.Attaches)
-		forwarded = true
-	}
+	text, attachments, forwarded, replyToID := parseLink(pm.Message.Link, pm.Message.Text, toAttachments(pm.Message.Attaches))
 	// Skip pure service pushes (no text AND no media); keep media-only messages.
 	if strings.TrimSpace(text) == "" && len(attachments) == 0 {
 		return false
@@ -959,6 +1371,7 @@ func (c *Client) tryMessage(f Frame) bool {
 		Attachments: attachments,
 		Outgoing:    senderID != 0 && senderID == c.selfID,
 		Forwarded:   forwarded,
+		ReplyToID:   replyToID,
 	}
 	// Hand off to the delivery worker (never block or make MAX requests on the
 	// read loop — that would deadlock, since replies arrive on this same loop).
@@ -1012,11 +1425,55 @@ func (c *Client) reactionLoop() {
 	}
 }
 
+// tryDelete parses a NOTIF_MSG_DELETE push and queues it for delivery.
+func (c *Client) tryDelete(f Frame) {
+	var dp deletePush
+	if err := json.Unmarshal(f.Payload, &dp); err != nil {
+		return
+	}
+	chatID := numToInt64(dp.ChatID)
+	if chatID == 0 || c.onDelete == nil {
+		return
+	}
+	var ids []string
+	if dp.MessageID != "" {
+		ids = append(ids, dp.MessageID.String())
+	}
+	for _, n := range dp.MessageIDs {
+		if n != "" {
+			ids = append(ids, n.String())
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+	select {
+	case c.deletes <- IncomingDelete{ChatID: chatID, MessageIDs: ids}:
+	default:
+		log.Printf("[max] delete queue full; dropping delete event for chat %d", chatID)
+	}
+}
+
+// deleteLoop hands queued delete events to onDelete, off the read loop.
+func (c *Client) deleteLoop() {
+	for d := range c.deletes {
+		func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Printf("[max] onDelete panic: %v", rec)
+				}
+			}()
+			c.onDelete(d)
+		}()
+	}
+}
+
 // deliverLoop enriches queued messages (chat title, sender name — via MAX
 // lookups that are safe here, off the read loop) and hands them to onMessage,
 // preserving order.
 func (c *Client) deliverLoop() {
 	for msg := range c.deliver {
+		c.resolveAttachments(msg.ChatID, msg.MessageID, msg.Attachments)
 		c.enrich(&msg)
 		if c.onMessage != nil {
 			func() {

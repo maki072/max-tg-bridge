@@ -85,7 +85,9 @@ func (b *Bridge) OnMaxMessage(m maxapi.IncomingMessage) {
 	b.postMessage(threadID, m)
 }
 
-// postMessage renders one MAX message into a topic (header + text + media).
+// postMessage renders one MAX message into a topic (header + text + media),
+// then records the tg<->max message link so later reactions/replies/deletes
+// (in either direction) can find their way back to this message.
 func (b *Bridge) postMessage(threadID int, m maxapi.IncomingMessage) {
 	prefix := ""
 	if m.Outgoing {
@@ -93,22 +95,43 @@ func (b *Bridge) postMessage(threadID int, m maxapi.IncomingMessage) {
 	}
 	if m.Forwarded {
 		prefix += "↪ "
+	} else if m.ReplyToID != "" {
+		prefix += "↩️ "
 	}
 	header := prefix + m.SenderName
-	if strings.TrimSpace(m.Text) != "" {
-		if err := b.bot.SendToTopic(threadID, header+":\n"+m.Text); err != nil {
-			log.Printf("[bridge] sendToTopic %d failed: %v", threadID, err)
+	chatKey := strconv.FormatInt(m.ChatID, 10)
+
+	var replyToTg int64
+	if m.ReplyToID != "" {
+		if link, ok := b.st.TgByMax(chatKey, m.ReplyToID); ok {
+			replyToTg = link.TgMsgID
 		}
 	}
+
+	linked := false
+	link := func(tgID int64) {
+		if !linked && tgID != 0 {
+			b.st.LinkMessages(chatKey, m.MessageID, tgID, threadID)
+			linked = true
+		}
+	}
+
+	if strings.TrimSpace(m.Text) != "" {
+		tgID, err := b.bot.SendToTopic(threadID, header+":\n"+m.Text, replyToTg)
+		if err != nil {
+			log.Printf("[bridge] sendToTopic %d failed: %v", threadID, err)
+		}
+		link(tgID)
+	}
 	for _, att := range m.Attachments {
-		b.forwardAttachment(threadID, header, att)
+		link(b.forwardAttachment(threadID, header, att, replyToTg))
 	}
 }
 
 // onNewTopic posts the chat avatar and backfills recent history into a new topic.
 func (b *Bridge) onNewTopic(threadID int, chatID int64) {
 	if url := b.max.ChatIcon(chatID); url != "" {
-		b.forwardAttachment(threadID, "🖼", maxapi.Attachment{Kind: "photo", URL: url})
+		b.forwardAttachment(threadID, "🖼", maxapi.Attachment{Kind: "photo", URL: url}, 0)
 	}
 	for _, hm := range b.max.History(chatID, b.cfg.HistoryCount) {
 		if hm.MessageID != "" && b.st.SeenAndMark("max:"+hm.MessageID) {
@@ -118,60 +141,140 @@ func (b *Bridge) onNewTopic(threadID int, chatID int64) {
 	}
 }
 
-// forwardAttachment downloads a MAX media attachment and posts it into the topic.
-func (b *Bridge) forwardAttachment(threadID int, header string, att maxapi.Attachment) {
+// forwardAttachment downloads a MAX media attachment and posts it into the
+// topic, optionally as a native Telegram reply (replyToTg == 0 means none).
+// Returns the id of the Telegram message it posted (0 if none/failed), for
+// tg<->max message linking.
+func (b *Bridge) forwardAttachment(threadID int, header string, att maxapi.Attachment, replyToTg int64) int64 {
 	caption := header + ":"
 	switch att.Kind {
 	case "photo":
 		data, _, err := httpDownload(att.URL, 25*1024*1024)
 		if err != nil {
 			log.Printf("[bridge] photo download failed: %v", err)
-			_ = b.bot.SendToTopic(threadID, caption+" 🖼 "+att.URL)
-			return
+			id, _ := b.bot.SendToTopic(threadID, caption+" 🖼 "+att.URL, replyToTg)
+			return id
 		}
 		// MAX photos are WebP; Telegram sendPhoto needs JPEG/PNG.
 		if jpg, err := webpToJPEG(data); err == nil {
 			data = jpg
 		}
-		if err := b.bot.SendPhoto(threadID, data, caption); err != nil {
+		id, err := b.bot.SendPhoto(threadID, data, caption, replyToTg)
+		if err != nil {
 			log.Printf("[bridge] sendPhoto failed: %v; sending as document", err)
-			_ = b.bot.SendDocument(threadID, data, "photo.jpg", caption)
+			id, _ = b.bot.SendDocument(threadID, data, "photo.jpg", caption, replyToTg)
 		}
+		return id
 	case "file":
 		data, _, err := httpDownload(att.URL, 45*1024*1024)
 		if err != nil {
 			log.Printf("[bridge] file download failed: %v", err)
-			_ = b.bot.SendToTopic(threadID, caption+" 📎 "+att.URL)
-			return
+			id, _ := b.bot.SendToTopic(threadID, caption+" 📎 "+att.URL, replyToTg)
+			return id
 		}
 		name := att.Name
 		if name == "" {
 			name = "file"
 		}
-		if err := b.bot.SendDocument(threadID, data, name, caption); err != nil {
+		id, err := b.bot.SendDocument(threadID, data, name, caption, replyToTg)
+		if err != nil {
 			log.Printf("[bridge] sendDocument failed: %v", err)
 		}
+		return id
 	case "video":
-		// Videos use large signed CDN URLs — post the link (Telegram will preview it).
-		_ = b.bot.SendToTopic(threadID, caption+" 🎥 "+att.URL)
+		// Videos carry a large signed CDN URL. Download it and re-upload so it
+		// plays inside Telegram; fall back to a document, then to posting the
+		// link (video missing / too big for the bot upload limit / fetch error).
+		data, _, tooLarge, err := httpDownloadCapped(att.URL, tgUploadLimit)
+		if att.URL == "" || tooLarge || err != nil || len(data) == 0 {
+			if err != nil {
+				log.Printf("[bridge] video download failed: %v; posting link", err)
+			} else if tooLarge {
+				log.Printf("[bridge] video exceeds %d bytes; posting link", tgUploadLimit)
+			}
+			id, _ := b.bot.SendToTopic(threadID, caption+" 🎥 "+att.URL, replyToTg)
+			return id
+		}
+		name := att.Name
+		if name == "" {
+			name = "video.mp4"
+		}
+		id, err := b.bot.SendVideo(threadID, data, name, caption, replyToTg)
+		if err != nil {
+			log.Printf("[bridge] sendVideo failed: %v; sending as document", err)
+			id, err = b.bot.SendDocument(threadID, data, name, caption, replyToTg)
+			if err != nil {
+				log.Printf("[bridge] sendDocument (video) failed: %v; posting link", err)
+				id, _ = b.bot.SendToTopic(threadID, caption+" 🎥 "+att.URL, replyToTg)
+			}
+		}
+		return id
 	case "voice":
-		// MAX gives us no fetchable URL for voice notes (see toAttachments) —
-		// post a visible placeholder instead of silently dropping the message.
-		_ = b.bot.SendToTopic(threadID, fmt.Sprintf("%s 🎤 Голосовое сообщение (%s) — откройте MAX, чтобы прослушать", caption, formatDuration(att.Duration)))
+		// Voice notes previously had no fetchable URL in most cases (MAX gave
+		// only an internal audioId/token); Client.resolveAttachments now tries
+		// AUDIO_PLAY first, so att.URL is populated whenever that succeeds.
+		// Fall back to the "open MAX" placeholder only if it's still empty.
+		if att.URL == "" {
+			return b.postVoicePlaceholder(threadID, caption, att.Duration, replyToTg)
+		}
+		data, _, tooLarge, err := httpDownloadCapped(att.URL, tgUploadLimit)
+		if tooLarge || err != nil || len(data) == 0 {
+			if err != nil {
+				log.Printf("[bridge] voice download failed: %v; posting placeholder", err)
+			}
+			return b.postVoicePlaceholder(threadID, caption, att.Duration, replyToTg)
+		}
+		name := att.Name
+		if name == "" {
+			name = "audio"
+		}
+		id, err := b.bot.SendVoice(threadID, data, caption, replyToTg)
+		if err != nil {
+			id, err = b.bot.SendAudio(threadID, data, name, caption, replyToTg)
+			if err != nil {
+				id, err = b.bot.SendDocument(threadID, data, name, caption, replyToTg)
+				if err != nil {
+					log.Printf("[bridge] voice/audio send failed: %v; posting placeholder", err)
+					return b.postVoicePlaceholder(threadID, caption, att.Duration, replyToTg)
+				}
+			}
+		}
+		return id
 	case "poll":
 		text := caption + " 📊 Голосование"
 		if strings.TrimSpace(att.Text) != "" {
 			text += ": " + att.Text
 		}
 		text += " — откройте MAX, чтобы посмотреть варианты и проголосовать"
-		_ = b.bot.SendToTopic(threadID, text)
+		id, _ := b.bot.SendToTopic(threadID, text, replyToTg)
+		return id
 	case "other":
+		// MAX substitutes a bare "UNSUPPORTED" attach (no other fields at
+		// all) for several content types it won't describe to a WEB session
+		// — confirmed live for both voice notes and polls, so it's likely a
+		// blanket "can't render this for you" marker rather than one
+		// specific type. Naming it plainly ("UNSUPPORTED") reads like an
+		// internal error to a user; say what's actually going on instead.
+		if att.Name == "UNSUPPORTED" {
+			text := caption + " 📎 Вложение недоступно для этой сессии MAX (голосовое, видео‑кружок, опрос или что‑то ещё — сервер не сообщает, что именно) — откройте MAX, чтобы посмотреть"
+			id, _ := b.bot.SendToTopic(threadID, text, replyToTg)
+			return id
+		}
 		label := att.Name
 		if label == "" {
 			label = "вложение"
 		}
-		_ = b.bot.SendToTopic(threadID, fmt.Sprintf("%s 📎 Неподдерживаемое вложение (%s) — откройте MAX, чтобы посмотреть", caption, label))
+		id, _ := b.bot.SendToTopic(threadID, fmt.Sprintf("%s 📎 Неподдерживаемое вложение (%s) — откройте MAX, чтобы посмотреть", caption, label), replyToTg)
+		return id
 	}
+	return 0
+}
+
+// postVoicePlaceholder posts the "open MAX to listen" notice used whenever a
+// voice note can't be re-uploaded (no URL, too large, or a fetch/send failure).
+func (b *Bridge) postVoicePlaceholder(threadID int, caption string, duration int64, replyToTg int64) int64 {
+	id, _ := b.bot.SendToTopic(threadID, fmt.Sprintf("%s 🎤 Голосовое сообщение (%s) — откройте MAX, чтобы прослушать", caption, formatDuration(duration)), replyToTg)
+	return id
 }
 
 // formatDuration renders a millisecond duration as m:ss for voice notes.
@@ -192,14 +295,85 @@ func (b *Bridge) OnMaxReaction(r maxapi.IncomingReaction) {
 		return
 	}
 	if len(r.Counters) == 0 {
-		_ = b.bot.SendToTopic(threadID, "🔔 Реакции на сообщение сняты")
+		_, _ = b.bot.SendToTopic(threadID, "🔔 Реакции на сообщение сняты", 0)
 		return
 	}
 	parts := make([]string, 0, len(r.Counters))
 	for _, c := range r.Counters {
 		parts = append(parts, fmt.Sprintf("%s x%d", c.Reaction, c.Count))
 	}
-	_ = b.bot.SendToTopic(threadID, "🔔 Реакция: "+strings.Join(parts, ", "))
+	_, _ = b.bot.SendToTopic(threadID, "🔔 Реакция: "+strings.Join(parts, ", "), 0)
+}
+
+// OnMaxDelete mirrors a MAX message deletion by deleting the Telegram message
+// that mirrors it, if one is known (only messages this bridge itself
+// forwarded — in either direction — are tracked, so unrelated chat history
+// is never touched).
+func (b *Bridge) OnMaxDelete(d maxapi.IncomingDelete) {
+	if b.bot.GroupID() == 0 {
+		return
+	}
+	chatKey := strconv.FormatInt(d.ChatID, 10)
+	for _, id := range d.MessageIDs {
+		link, ok := b.st.TgByMax(chatKey, id)
+		if !ok {
+			continue
+		}
+		if err := b.bot.DeleteMessage(link.TgMsgID); err != nil {
+			log.Printf("[bridge] delete mirrored tg message %d (max msg %s) failed: %v", link.TgMsgID, id, err)
+		}
+	}
+}
+
+// handleReaction forwards a Telegram message_reaction update to MAX: setting
+// (or, if all reactions were removed, clearing) our reaction on the MAX
+// message the reacted-to Telegram message mirrors.
+func (b *Bridge) handleReaction(r *tg.MessageReactionUpdated) {
+	if b.bot.GroupID() == 0 || r.Chat.ID != b.bot.GroupID() || r.User == nil || r.User.IsBot {
+		return
+	}
+	link, ok := b.st.MaxByTg(r.MessageID)
+	if !ok {
+		return
+	}
+	chatID, err := strconv.ParseInt(link.MaxChatID, 10, 64)
+	if err != nil {
+		return
+	}
+	if len(r.NewReaction) == 0 {
+		if err := b.max.RemoveReaction(chatID, link.MaxMsgID); err != nil {
+			log.Printf("[bridge] MAX remove reaction failed: %v", err)
+		}
+		return
+	}
+	emoji := r.NewReaction[0].Emoji
+	if emoji == "" {
+		return // custom_emoji reaction — no MAX equivalent
+	}
+	if err := b.max.AddReaction(chatID, link.MaxMsgID, emoji); err != nil {
+		log.Printf("[bridge] MAX add reaction failed: %v", err)
+	}
+}
+
+// handleEdit forwards a Telegram edited_message update to MAX (MSG_EDIT), for
+// a message this bridge itself previously sent to MAX from that same
+// Telegram message. Edits made directly in MAX are not currently mirrored
+// back — no confirmed push opcode for that exists.
+func (b *Bridge) handleEdit(m *tg.Message) {
+	if b.bot.GroupID() == 0 || m.Chat.ID != b.bot.GroupID() || m.MessageThreadID == 0 {
+		return
+	}
+	link, ok := b.st.MaxByTg(m.MessageID)
+	if !ok {
+		return
+	}
+	chatID, err := strconv.ParseInt(link.MaxChatID, 10, 64)
+	if err != nil {
+		return
+	}
+	if err := b.max.EditMessage(chatID, link.MaxMsgID, m.Text); err != nil {
+		log.Printf("[bridge] MAX edit message failed: %v", err)
+	}
 }
 
 func (b *Bridge) RunTelegram() {
@@ -267,11 +441,19 @@ func (b *Bridge) isAdmin(userID int64) bool {
 }
 
 func (b *Bridge) handleUpdate(u tg.Update) {
+	if u.MessageReaction != nil {
+		b.handleReaction(u.MessageReaction)
+		return
+	}
+	if u.EditedMessage != nil {
+		b.handleEdit(u.EditedMessage)
+		return
+	}
 	msg := u.Message
 	if msg == nil || msg.From.IsBot {
 		return
 	}
-	hasMedia := len(msg.Photo) > 0 || msg.Document != nil
+	hasMedia := len(msg.Photo) > 0 || msg.Document != nil || msg.Video != nil || msg.Voice != nil || msg.Audio != nil || msg.Sticker != nil
 
 	// 1. Приватные сообщения боту (Личка) — только для Администраторов группы!
 	if msg.Chat.Type == "private" {
@@ -312,34 +494,141 @@ func (b *Bridge) handleUpdate(u tg.Update) {
 		return
 	}
 
-	if hasMedia {
+	// "/del" (or "/delete") as a reply to a mirrored message deletes the
+	// corresponding MAX message — Telegram's Bot API has no "message was
+	// deleted" update, so this is the only way to drive MSG_DELETE from here.
+	cmdText := strings.ToLower(strings.TrimSpace(msg.Text))
+	if (cmdText == "/del" || cmdText == "/delete") && msg.ReplyToMessage != nil {
+		if link, ok := b.st.MaxByTg(msg.ReplyToMessage.MessageID); ok {
+			if err := b.max.DeleteMessage(chatID, link.MaxMsgID, false); err != nil {
+				log.Printf("[bridge] MAX delete message %s failed: %v", link.MaxMsgID, err)
+			}
+		}
+		return
+	}
+
+	// If this Telegram message replies to one we can map back to a MAX
+	// message (one MAX sent that we mirrored here, or one an admin sent from
+	// Telegram earlier), carry that over as a MAX REPLY link.
+	var replyToMax string
+	if msg.ReplyToMessage != nil {
+		if link, ok := b.st.MaxByTg(msg.ReplyToMessage.MessageID); ok {
+			replyToMax = link.MaxMsgID
+		}
+	}
+
+	// NOTE: video/voice are deliberately sent via the plain FILE_UPLOAD path
+	// (SendFileReply), NOT the native VIDEO_UPLOAD attach type. Live testing
+	// showed MAX reject a native voice (AUDIO) attach with "Invalid
+	// attachment" AND — reproduced twice — kill the whole websocket session
+	// (1006) right after, with the very next request often timing out
+	// post-reconnect too (looks like a brief server-side cooldown/anti-abuse
+	// reaction to the malformed frame). Given this repo's own risk-of-ban
+	// disclaimer, that's not a trade worth making for a cosmetic "shows as a
+	// real video/voice" gain, so both use FILE_UPLOAD, the long-proven-safe
+	// path (video shares VIDEO_UPLOAD's upload mechanics with voice, so it's
+	// kept on the safe path too even though only voice was confirmed bad).
+	// Photo is the exception — see its case below: PHOTO_UPLOAD is a
+	// completely different, simpler flow and was confirmed working live.
+	var maxMsgID string
+	switch {
+	case msg.Voice != nil:
+		data, _, dlErr := b.bot.DownloadFile(msg.Voice.FileID)
+		if dlErr != nil {
+			log.Printf("[bridge] TG voice download failed: %v", dlErr)
+			return
+		}
+		maxMsgID, err = b.max.SendFileReply(chatID, "voice.ogg", data, msg.Caption, replyToMax)
+		if err != nil {
+			log.Printf("[bridge] MAX SendFile (voice) to chat %d failed: %v", chatID, err)
+		}
+	case msg.Video != nil:
+		data, dlName, dlErr := b.bot.DownloadFile(msg.Video.FileID)
+		if dlErr != nil {
+			log.Printf("[bridge] TG video download failed: %v", dlErr)
+			return
+		}
+		name := msg.Video.FileName
+		if name == "" {
+			name = dlName
+		}
+		maxMsgID, err = b.max.SendFileReply(chatID, name, data, msg.Caption, replyToMax)
+		if err != nil {
+			log.Printf("[bridge] MAX SendFile (video) to chat %d failed: %v", chatID, err)
+		}
+	case len(msg.Photo) > 0:
+		// Unlike voice/video, PHOTO_UPLOAD is a simple synchronous flow (the
+		// token comes straight back in the HTTP upload response, no
+		// NOTIF_ATTACH wait) and has been confirmed live to work without
+		// issue, so photos DO use the native attach — falls back to a plain
+		// file only if MAX still rejects it for some reason.
+		data, _, dlErr := b.bot.DownloadFile(msg.Photo[len(msg.Photo)-1].FileID) // largest size
+		if dlErr != nil {
+			log.Printf("[bridge] TG photo download failed: %v", dlErr)
+			return
+		}
+		maxMsgID, err = b.max.SendPhoto(chatID, data, msg.Caption, replyToMax)
+		if err != nil {
+			log.Printf("[bridge] MAX SendPhoto to chat %d failed: %v; sending as file instead", chatID, err)
+			maxMsgID, err = b.max.SendFileReply(chatID, "photo.jpg", data, msg.Caption, replyToMax)
+			if err != nil {
+				log.Printf("[bridge] MAX SendFile (photo fallback) to chat %d failed: %v", chatID, err)
+			}
+		}
+	case msg.Sticker != nil:
+		// MAX has no way to accept an arbitrary Telegram sticker as a native
+		// MAX sticker (that requires owning/registering a sticker pack via
+		// STICKER_SYNC/STICKER_DATA — out of scope), so it goes through as a
+		// plain file: .webp for static, .webm for video stickers, .tgs
+		// (gzipped Lottie JSON — not directly viewable, but at least not lost)
+		// for animated ones.
+		data, _, dlErr := b.bot.DownloadFile(msg.Sticker.FileID)
+		if dlErr != nil {
+			log.Printf("[bridge] TG sticker download failed: %v", dlErr)
+			return
+		}
+		ext := "webp"
+		if msg.Sticker.IsVideo {
+			ext = "webm"
+		} else if msg.Sticker.IsAnimated {
+			ext = "tgs"
+		}
+		name := "sticker." + ext
+		if msg.Sticker.Emoji != "" {
+			name = msg.Sticker.Emoji + " " + name
+		}
+		maxMsgID, err = b.max.SendFileReply(chatID, name, data, msg.Caption, replyToMax)
+		if err != nil {
+			log.Printf("[bridge] MAX SendFile (sticker) to chat %d failed: %v", chatID, err)
+		}
+	case msg.Document != nil || msg.Audio != nil:
 		var fileID, name string
 		if msg.Document != nil {
 			fileID, name = msg.Document.FileID, msg.Document.FileName
 		} else {
-			fileID, name = msg.Photo[len(msg.Photo)-1].FileID, "photo.jpg" // largest size
+			fileID, name = msg.Audio.FileID, msg.Audio.FileName
 		}
-		data, dlName, err := b.bot.DownloadFile(fileID)
-		if err != nil {
-			log.Printf("[bridge] TG file download failed: %v", err)
+		data, dlName, dlErr := b.bot.DownloadFile(fileID)
+		if dlErr != nil {
+			log.Printf("[bridge] TG file download failed: %v", dlErr)
 			return
 		}
 		if name == "" {
 			name = dlName
 		}
-		if id, err := b.max.SendFile(chatID, name, data, msg.Caption); err != nil {
+		maxMsgID, err = b.max.SendFileReply(chatID, name, data, msg.Caption, replyToMax)
+		if err != nil {
 			log.Printf("[bridge] MAX SendFile to chat %d failed: %v", chatID, err)
-		} else if id != "" {
-			b.st.SeenAndMark("max:" + id)
 		}
-		return
+	default:
+		maxMsgID, err = b.max.SendMessageReply(chatID, msg.Text, replyToMax)
+		if err != nil {
+			log.Printf("[bridge] MAX send to chat %d failed: %v", chatID, err)
+		}
 	}
-
-	msgID, err := b.max.SendMessage(chatID, msg.Text)
-	if err != nil {
-		log.Printf("[bridge] MAX send to chat %d failed: %v", chatID, err)
-	} else if msgID != "" {
-		b.st.SeenAndMark("max:" + msgID) // skip our own echo
+	if maxMsgID != "" {
+		b.st.SeenAndMark("max:" + maxMsgID) // skip our own echo
+		b.st.LinkMessages(chatKey, maxMsgID, msg.MessageID, msg.MessageThreadID)
 	}
 }
 
@@ -528,7 +817,12 @@ func (b *Bridge) processCommand(text string) string {
 		if len(logs) == 0 {
 			return "📋 Debug log пуст. Сервер пока не присылал событий (Push/Ping)."
 		}
-		return "--- Последние фреймы от MAX ---\n\n" + strings.Join(logs[len(logs)-10:], "\n\n")
+		n := 10
+		if len(logs) < n {
+			n = len(logs) // fewer than 10 frames so far (e.g. right after a fresh
+			// reconnect) — avoid a negative slice bound.
+		}
+		return "--- Последние фреймы от MAX ---\n\n" + strings.Join(logs[len(logs)-n:], "\n\n")
 
 	default:
 		return ""

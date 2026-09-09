@@ -4,6 +4,8 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"log"
+	"strings"
 )
 
 // Protocol constants for the MAX WebSocket transport (ver=11, JSON frames).
@@ -64,15 +66,33 @@ const (
 	OpForwardMessage = 70 // FORWARD_MESSAGE
 	OpSearchMessages = 73 // SEARCH_MESSAGES
 
+	// Reactions
+	OpMsgReaction       = 178 // MSG_REACTION — add/replace our reaction on a message
+	OpMsgCancelReaction = 179 // MSG_CANCEL_REACTION — remove our reaction
+	OpMsgGetReactions   = 180 // MSG_GET_REACTIONS — bulk reaction lookup (unused for now)
+
+	// Polls
+	OpSendVote = 304 // SEND_VOTE — vote in a poll (unused for now, reserved)
+
 	// Media / files / stickers
 	OpGetPresetAvatars = 25  // GET_PRESET_AVATARS
 	OpStickerSync      = 26  // STICKER_SYNC
 	OpStickerData      = 27  // STICKER_DATA
 	OpAnimojiGet       = 28  // ANIMOJI_AND_STICKER_GET
-	OpImageUploadURL   = 80  // IMAGE_UPLOAD_URL
-	OpImageUploadSmile = 81  // IMAGE_UPLOAD_IUSMILE
+	OpImageUploadURL   = 80  // IMAGE_UPLOAD_URL / PHOTO_UPLOAD — request a photo upload slot
+	OpImageUploadSmile = 81  // IMAGE_UPLOAD_IUSMILE / STICKER_UPLOAD
+	OpVideoUpload      = 82  // VIDEO_UPLOAD — request an upload slot for video/voice/video-note
+	OpVideoPlay        = 83  // VIDEO_PLAY — resolve a temporary playable URL for a VIDEO attach ({chatId,messageId,videoId} -> {MP4_*, EXTERNAL})
 	OpFileUpload       = 87  // FILE_UPLOAD
+	OpFileDownload     = 88  // FILE_DOWNLOAD — resolve a temporary URL for a FILE attach ({chatId,messageId,fileId} -> {url,unsafe})
 	OpGetBanners       = 302 // GET_BANNERS
+	// OpAudioPlay resolves a temporary URL for a voice/AUDIO attach, mirroring
+	// OpVideoPlay/OpFileDownload ({chatId,messageId,audioId} -> presumably
+	// {url,...}). Confirmed to exist in the reverse-engineered opcode table but
+	// NOT documented/implemented by any known client (PyMax declares it but
+	// never calls it) — used here as a best-effort attempt; see
+	// Client.getAudioURL for the defensive parsing.
+	OpAudioPlay = 301 // AUDIO_PLAY
 
 	// Calls
 	OpCallEdit    = 69  // CALL_EDIT
@@ -134,8 +154,8 @@ var ignoredPushOpcodes = map[int]bool{
 	136: true, // NOTIF_ATTACH
 	137: true, // NOTIF_INCOMING_CALL
 	140: true, // NOTIF_MSG_DELETE_RANGE
-	142: true, // NOTIF_MSG_DELETE
-	// 156 (NOTIF_REACTION) is handled explicitly in handlePush, not ignored.
+	// 142 (NOTIF_MSG_DELETE) and 156 (NOTIF_REACTION) are handled explicitly
+	// in handlePush, not ignored.
 }
 
 // ReactionCounter is one emoji's tally on a message.
@@ -166,6 +186,23 @@ type IncomingReaction struct {
 	MessageID  string
 	Counters   []ReactionCounter
 	TotalCount int
+}
+
+// deletePush is the wire shape of NOTIF_MSG_DELETE (opcode 142): a chat and
+// one or more deleted message ids. The exact field name for the id list is
+// unconfirmed (the reverse-engineered docs only flag a "cascading deletion
+// risk"), so both a single "messageId" and a "messageIds" array are accepted
+// defensively — whichever the server actually sends will parse.
+type deletePush struct {
+	ChatID     json.Number   `json:"chatId"`
+	MessageID  json.Number   `json:"messageId"`
+	MessageIDs []json.Number `json:"messageIds"`
+}
+
+// IncomingDelete is a normalized NOTIF_MSG_DELETE event forwarded to the bridge.
+type IncomingDelete struct {
+	ChatID     int64
+	MessageIDs []string
 }
 
 // Frame is a single WebSocket JSON frame.
@@ -210,10 +247,21 @@ func defaultUserAgent() UserAgent {
 // Attachment is a normalized media attachment of an incoming message.
 type Attachment struct {
 	Kind     string // "photo" | "file" | "video" | "voice" | "poll" | "other"
-	URL      string // direct, publicly fetchable URL (photo/file/video only)
+	URL      string // direct, publicly fetchable URL (photo/file/video, and voice when MAX exposes one)
 	Name     string // file name (for documents) or a human label for other kinds
 	Duration int64  // duration in ms (voice notes)
 	Text     string // extra text (e.g. a poll question, when the server includes one)
+
+	// ResolveKind/ResolveID/ResolveToken are set when MAX gave only an
+	// internal id (+ token) with no directly fetchable URL — the common case
+	// for VIDEO/FILE and (previously unfixable) voice/AUDIO attaches.
+	// Client.resolveAttachments (called off the read loop, from deliverLoop /
+	// History) turns these into a real URL via VIDEO_PLAY / FILE_DOWNLOAD /
+	// AUDIO_PLAY before the message reaches the bridge, filling in URL above.
+	// Empty ResolveKind means there is nothing to resolve.
+	ResolveKind  string // "video" | "file" | "audio"
+	ResolveID    int64
+	ResolveToken string
 }
 
 // IncomingMessage is a normalized new message forwarded to the bridge.
@@ -225,9 +273,10 @@ type IncomingMessage struct {
 	MessageID   string
 	Text        string
 	Attachments []Attachment
-	Opcode      int  // raw push opcode it arrived on (useful for discovery)
-	Outgoing    bool // true if sent by us (self) from the MAX app/web
-	Forwarded   bool // true if this is a forwarded message
+	Opcode      int    // raw push opcode it arrived on (useful for discovery)
+	Outgoing    bool   // true if sent by us (self) from the MAX app/web
+	Forwarded   bool   // true if this is a forwarded message
+	ReplyToID   string // MAX message id this is a reply to ("" if not a reply)
 }
 
 // attach is a message attachment as MAX sends it. PHOTO exposes a public webp
@@ -237,14 +286,29 @@ type IncomingMessage struct {
 // carry a question under one of a few possible field names — best-effort
 // parsed since the wire schema for MAX polls is not documented anywhere.
 type attach struct {
-	Type     string `json:"_type"`
-	BaseURL  string `json:"baseUrl"`
-	FileURL  string `json:"fileUrl"`
-	URL      string `json:"url"`
-	Name     string `json:"name"`
-	Duration int64  `json:"duration"` // ms, present on voice/audio attaches
-	Text     string `json:"text"`     // best-effort: poll question, if present here
-	Question string `json:"question"` // best-effort: poll question, alt field name
+	Type     string      `json:"_type"`
+	BaseURL  string      `json:"baseUrl"`
+	FileURL  string      `json:"fileUrl"`
+	URL      string      `json:"url"`
+	Name     string      `json:"name"`
+	Duration int64       `json:"duration"` // ms, present on voice/audio attaches
+	Text     string      `json:"text"`     // best-effort: poll question, if present here
+	Question string      `json:"question"` // best-effort: poll question, alt field name
+	FileID   json.Number `json:"fileId"`   // FILE attaches: internal id, pairs with Token
+	VideoID  json.Number `json:"videoId"`  // VIDEO attaches: internal id, pairs with Token
+	AudioID  json.Number `json:"audioId"`  // AUDIO/UNSUPPORTED (voice) attaches: internal id, pairs with Token
+	Token    string      `json:"token"`    // internal token that pairs with fileId/videoId/audioId
+}
+
+// msgLink is a message's "link" object: a FORWARD nests the original message
+// under Message (leaving the outer text/attaches empty); a REPLY normally
+// carries just the target MessageID (matches the MessageID field pymax's own
+// ReplyLink/ForwardLink send — {type:"REPLY"|"FORWARD", messageId}), though
+// some server versions may also nest the quoted Message.
+type msgLink struct {
+	Type      string      `json:"type"`
+	MessageID json.Number `json:"messageId"`
+	Message   *msgBody    `json:"message"`
 }
 
 // msgBody is a message body (self-referential: a forwarded message nests the
@@ -256,10 +320,7 @@ type msgBody struct {
 	Type     string      `json:"type"`
 	Time     int64       `json:"time"`
 	Attaches []attach    `json:"attaches"`
-	Link     *struct {
-		Type    string   `json:"type"`
-		Message *msgBody `json:"message"`
-	} `json:"link"`
+	Link     *msgLink    `json:"link"`
 }
 
 // pushMessage is the minimal shape of a message-bearing push payload.
@@ -300,29 +361,62 @@ func toAttachments(as []attach) []Attachment {
 			if u == "" {
 				u = a.URL
 			}
-			if u != "" {
-				out = append(out, Attachment{Kind: "file", URL: u, Name: a.Name})
-			} else {
+			att := Attachment{Kind: "file", URL: u, Name: a.Name}
+			if u == "" && a.FileID != "" {
+				// No direct URL — resolve one lazily via FILE_DOWNLOAD (opcode 88).
+				att.ResolveKind = "file"
+				att.ResolveID = numToInt64(a.FileID)
+				att.ResolveToken = a.Token
+			}
+			if att.URL == "" && att.ResolveKind == "" {
 				out = append(out, Attachment{Kind: "other", Name: "FILE " + a.Name})
+			} else {
+				out = append(out, att)
 			}
 		case "VIDEO":
 			u := a.URL
 			if u == "" {
 				u = a.FileURL
 			}
-			if u != "" {
-				out = append(out, Attachment{Kind: "video", URL: u, Name: a.Name})
-			} else {
+			att := Attachment{Kind: "video", URL: u, Name: a.Name}
+			if u == "" && a.VideoID != "" {
+				// No direct URL — MAX web pushes normally omit one for video and
+				// expect the client to call VIDEO_PLAY (opcode 83) instead.
+				att.ResolveKind = "video"
+				att.ResolveID = numToInt64(a.VideoID)
+				att.ResolveToken = a.Token
+			}
+			if att.URL == "" && att.ResolveKind == "" {
 				out = append(out, Attachment{Kind: "other", Name: "VIDEO"})
+			} else {
+				out = append(out, att)
 			}
 		case "AUDIO", "UNSUPPORTED":
 			// Voice notes: the server sometimes reports the real type (AUDIO),
-			// sometimes substitutes UNSUPPORTED for our WEB device type — both
-			// carry a "duration" (ms) but no fetchable URL in either case.
-			if a.Duration > 0 {
-				out = append(out, Attachment{Kind: "voice", Duration: a.Duration})
-			} else {
+			// sometimes substitutes UNSUPPORTED for our WEB device type. Both
+			// carry a "duration" (ms). There is usually no fetchable URL (only
+			// an internal audioId/token) — resolve one lazily via the
+			// best-effort AUDIO_PLAY (opcode 301); if that also comes up empty
+			// the bridge falls back to the "open MAX" placeholder as before.
+			u := a.URL
+			if u == "" {
+				u = a.FileURL
+			}
+			if u == "" {
+				u = a.BaseURL
+			}
+			att := Attachment{Kind: "voice", URL: u, Duration: a.Duration, Name: a.Name}
+			if u == "" && a.AudioID != "" {
+				att.ResolveKind = "audio"
+				att.ResolveID = numToInt64(a.AudioID)
+				att.ResolveToken = a.Token
+				log.Printf("[max] voice note without URL: type=%s duration=%dms audioId=%s hasToken=%t (will try AUDIO_PLAY)",
+					a.Type, a.Duration, a.AudioID, a.Token != "")
+			}
+			if u == "" && att.ResolveKind == "" && a.Duration == 0 {
 				out = append(out, Attachment{Kind: "other", Name: a.Type})
+			} else {
+				out = append(out, att)
 			}
 		case "POLL":
 			q := a.Text
@@ -337,6 +431,32 @@ func toAttachments(as []attach) []Attachment {
 		}
 	}
 	return out
+}
+
+// parseLink interprets a message's "link" object. For a FORWARD (or an
+// unrecognized link type carrying nested content — kept for compatibility
+// with the original forward-detection heuristic) it returns the nested
+// message's text/attachments in place of the (empty) outer ones. For a REPLY
+// it leaves text/attachments untouched and returns the target MAX message id.
+func parseLink(link *msgLink, text string, attachments []Attachment) (outText string, outAttachments []Attachment, forwarded bool, replyToID string) {
+	outText, outAttachments = text, attachments
+	if link == nil {
+		return
+	}
+	if link.Type == "REPLY" {
+		if link.MessageID != "" {
+			replyToID = link.MessageID.String()
+		} else if link.Message != nil {
+			replyToID = link.Message.ID.String()
+		}
+		return
+	}
+	if link.Message != nil && strings.TrimSpace(text) == "" && len(attachments) == 0 {
+		outText = link.Message.Text
+		outAttachments = toAttachments(link.Message.Attaches)
+		forwarded = true
+	}
+	return
 }
 
 // NewDeviceID returns a fresh random UUIDv4 string, for callers (store,
