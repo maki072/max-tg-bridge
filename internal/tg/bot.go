@@ -57,6 +57,12 @@ func (b *Bot) SendAudio(threadID int, audio []byte, filename, caption string, re
 	return b.sendMedia("sendAudio", "audio", filename, audio, threadID, caption, replyToTgMsgID)
 }
 
+// SendSticker uploads a sticker file (.webp, .tgs or .webm — Telegram rejects
+// other formats). Stickers carry no caption.
+func (b *Bot) SendSticker(threadID int, data []byte, filename string, replyToTgMsgID int64) (int64, error) {
+	return b.sendMedia("sendSticker", "sticker", filename, data, threadID, "", replyToTgMsgID)
+}
+
 // sentMessage extracts just the id from a Telegram send-method result.
 type sentMessage struct {
 	MessageID int64 `json:"message_id"`
@@ -359,6 +365,29 @@ func (b *Bot) SendMessage(text string) error {
 // non-zero, makes this a native Telegram reply to that message. Returns the
 // created message id (0 on failure) for reaction/reply/delete linking.
 func (b *Bot) SendToTopic(threadID int, text string, replyToTgMsgID int64) (int64, error) {
+	return b.SendToTopicMarkup(threadID, text, replyToTgMsgID, nil)
+}
+
+// InlineKeyboardButton is a button under a message; pressing it sends a
+// callback_query carrying CallbackData (max 64 bytes) back to the bot.
+type InlineKeyboardButton struct {
+	Text         string        `json:"text"`
+	CallbackData string        `json:"callback_data,omitempty"`
+	URL          string        `json:"url,omitempty"`
+	CopyText     *CopyTextInfo `json:"copy_text,omitempty"` // Bot API 7.11: copies Text to the clipboard
+}
+
+// CopyTextInfo is the payload of a "copy to clipboard" inline button.
+type CopyTextInfo struct {
+	Text string `json:"text"`
+}
+
+type InlineKeyboardMarkup struct {
+	InlineKeyboard [][]InlineKeyboardButton `json:"inline_keyboard"`
+}
+
+// SendToTopicMarkup is SendToTopic with an optional inline keyboard.
+func (b *Bot) SendToTopicMarkup(threadID int, text string, replyToTgMsgID int64, markup *InlineKeyboardMarkup) (int64, error) {
 	body := map[string]any{
 		"chat_id":           b.GroupID(),
 		"message_thread_id": threadID,
@@ -367,11 +396,153 @@ func (b *Bot) SendToTopic(threadID int, text string, replyToTgMsgID int64) (int6
 	if replyToTgMsgID != 0 {
 		body["reply_to_message_id"] = replyToTgMsgID
 	}
+	if markup != nil {
+		body["reply_markup"] = markup
+	}
 	var sm sentMessage
 	if err := b.call("sendMessage", body, &sm); err != nil {
 		return 0, err
 	}
 	return sm.MessageID, nil
+}
+
+// Telegram's native poll limits (Bot API): question length, option count and
+// option length. Polls outside them can't be sent with sendPoll.
+const (
+	PollMaxQuestion = 300
+	PollMaxOptions  = 12
+	PollMaxOption   = 100
+)
+
+// SendPoll posts a native, non-anonymous Telegram poll into a topic (so the
+// bot receives poll_answer updates with the voter's id). Returns the message
+// id and the Telegram poll id.
+func (b *Bot) SendPoll(threadID int, question string, options []string, replyToTgMsgID int64) (int64, string, error) {
+	opts := make([]map[string]string, len(options))
+	for i, o := range options {
+		opts[i] = map[string]string{"text": o}
+	}
+	body := map[string]any{
+		"chat_id":           b.GroupID(),
+		"message_thread_id": threadID,
+		"question":          question,
+		"options":           opts,
+		"is_anonymous":      false,
+	}
+	if replyToTgMsgID != 0 {
+		body["reply_to_message_id"] = replyToTgMsgID
+	}
+	var res struct {
+		MessageID int64 `json:"message_id"`
+		Poll      struct {
+			ID string `json:"id"`
+		} `json:"poll"`
+	}
+	if err := b.call("sendPoll", body, &res); err != nil {
+		return 0, "", err
+	}
+	return res.MessageID, res.Poll.ID, nil
+}
+
+// EditMessageText replaces the text (and inline keyboard) of a message in the
+// group. An edit that changes nothing is not treated as an error.
+func (b *Bot) EditMessageText(tgMsgID int64, text string, markup *InlineKeyboardMarkup) error {
+	return b.EditChatMessage(b.GroupID(), tgMsgID, text, markup)
+}
+
+// EditChatMessage is EditMessageText for any chat (the control panel also
+// lives in private chats with admins).
+func (b *Bot) EditChatMessage(chatID, tgMsgID int64, text string, markup *InlineKeyboardMarkup) error {
+	body := map[string]any{"chat_id": chatID, "message_id": tgMsgID, "text": text}
+	if markup != nil {
+		body["reply_markup"] = markup
+	}
+	err := b.call("editMessageText", body, nil)
+	if err != nil && strings.Contains(err.Error(), "message is not modified") {
+		return nil
+	}
+	return err
+}
+
+// SendChat sends text (with an optional inline keyboard) to any chat; threadID
+// 0 means no topic (a private chat, or the group's General topic).
+func (b *Bot) SendChat(chatID int64, threadID int, text string, markup *InlineKeyboardMarkup) (int64, error) {
+	body := map[string]any{"chat_id": chatID, "text": text}
+	if threadID != 0 {
+		body["message_thread_id"] = threadID
+	}
+	if markup != nil {
+		body["reply_markup"] = markup
+	}
+	var sm sentMessage
+	if err := b.call("sendMessage", body, &sm); err != nil {
+		return 0, err
+	}
+	return sm.MessageID, nil
+}
+
+// PinMessage pins a message in the bridged group, silently.
+func (b *Bot) PinMessage(tgMsgID int64) error {
+	return b.call("pinChatMessage", map[string]any{
+		"chat_id": b.GroupID(), "message_id": tgMsgID, "disable_notification": true,
+	}, nil)
+}
+
+// SendLocation posts a map point into a topic.
+func (b *Bot) SendLocation(threadID int, lat, lon float64, replyToTgMsgID int64) (int64, error) {
+	body := map[string]any{
+		"chat_id": b.GroupID(), "message_thread_id": threadID,
+		"latitude": lat, "longitude": lon,
+	}
+	if replyToTgMsgID != 0 {
+		body["reply_to_message_id"] = replyToTgMsgID
+	}
+	var sm sentMessage
+	if err := b.call("sendLocation", body, &sm); err != nil {
+		return 0, err
+	}
+	return sm.MessageID, nil
+}
+
+// SendContact posts a phone contact card into a topic.
+func (b *Bot) SendContact(threadID int, phone, firstName, lastName string, replyToTgMsgID int64) (int64, error) {
+	body := map[string]any{
+		"chat_id": b.GroupID(), "message_thread_id": threadID,
+		"phone_number": phone, "first_name": firstName,
+	}
+	if lastName != "" {
+		body["last_name"] = lastName
+	}
+	if replyToTgMsgID != 0 {
+		body["reply_to_message_id"] = replyToTgMsgID
+	}
+	var sm sentMessage
+	if err := b.call("sendContact", body, &sm); err != nil {
+		return 0, err
+	}
+	return sm.MessageID, nil
+}
+
+// DeleteForumTopic deletes a topic together with all its messages.
+func (b *Bot) DeleteForumTopic(threadID int) error {
+	return b.call("deleteForumTopic", map[string]any{
+		"chat_id": b.GroupID(), "message_thread_id": threadID,
+	}, nil)
+}
+
+// RenameForumTopic changes a topic's title.
+func (b *Bot) RenameForumTopic(threadID int, name string) error {
+	return b.call("editForumTopic", map[string]any{
+		"chat_id": b.GroupID(), "message_thread_id": threadID, "name": truncateName(name),
+	}, nil)
+}
+
+// AnswerCallbackQuery acknowledges an inline-button press, optionally showing
+// text to the user (as a toast, or a modal alert when alert is true).
+func (b *Bot) AnswerCallbackQuery(id, text string, alert bool) error {
+	return b.call("answerCallbackQuery", map[string]any{
+		"callback_query_id": id, "text": text, "show_alert": alert,
+	}, nil)
 }
 
 // DeleteMessage deletes a message in the bridged group (used to mirror a MAX
@@ -418,6 +589,15 @@ type Message struct {
 		IsAnimated bool   `json:"is_animated"` // TGS (gzipped Lottie JSON)
 		IsVideo    bool   `json:"is_video"`    // WEBM
 	} `json:"sticker"`
+	Location *struct {
+		Latitude  float64 `json:"latitude"`
+		Longitude float64 `json:"longitude"`
+	} `json:"location"`
+	Contact *struct {
+		PhoneNumber string `json:"phone_number"`
+		FirstName   string `json:"first_name"`
+		LastName    string `json:"last_name"`
+	} `json:"contact"`
 	// ReplyToMessage is set when this message replies to another one in the
 	// same chat — used to attach a MAX REPLY link (via the store's tg<->max
 	// message map) when forwarding Telegram -> MAX.
@@ -456,12 +636,40 @@ type MessageReactionUpdated struct {
 	NewReaction []ReactionType `json:"new_reaction"`
 }
 
+// CallbackQuery is an inline-keyboard button press.
+type CallbackQuery struct {
+	ID   string `json:"id"`
+	From struct {
+		ID        int64  `json:"id"`
+		IsBot     bool   `json:"is_bot"`
+		FirstName string `json:"first_name"`
+		Username  string `json:"username"`
+	} `json:"from"`
+	Message *Message `json:"message"` // the message the button is attached to
+	Data    string   `json:"data"`
+}
+
+// PollAnswer is a vote (or retraction, when OptionIDs is empty) in a
+// non-anonymous poll the bot sent.
+type PollAnswer struct {
+	PollID string `json:"poll_id"`
+	User   *struct {
+		ID        int64  `json:"id"`
+		IsBot     bool   `json:"is_bot"`
+		FirstName string `json:"first_name"`
+		Username  string `json:"username"`
+	} `json:"user"`
+	OptionIDs []int `json:"option_ids"` // 0-based indexes into the poll's options
+}
+
 // Update is the subset of a Telegram update this bridge consumes.
 type Update struct {
 	UpdateID        int64                   `json:"update_id"`
 	Message         *Message                `json:"message"`
 	EditedMessage   *Message                `json:"edited_message"`
 	MessageReaction *MessageReactionUpdated `json:"message_reaction"`
+	CallbackQuery   *CallbackQuery          `json:"callback_query"`
+	PollAnswer      *PollAnswer             `json:"poll_answer"`
 }
 
 // DownloadFile fetches a Telegram file by file_id (getFile + download through the
@@ -491,7 +699,7 @@ func (b *Bot) GetUpdates(offset int64, timeoutSec int) ([]Update, error) {
 	q := url.Values{}
 	q.Set("offset", strconv.FormatInt(offset, 10))
 	q.Set("timeout", strconv.Itoa(timeoutSec))
-	q.Set("allowed_updates", `["message","edited_message","message_reaction"]`)
+	q.Set("allowed_updates", `["message","edited_message","message_reaction","callback_query","poll_answer"]`)
 
 	resp, err := b.http.Get(b.base + "/getUpdates?" + q.Encode())
 	if err != nil {

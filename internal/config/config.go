@@ -46,6 +46,31 @@ type Config struct {
 	// first created (0 = off). Kept modest by default — Telegram rate-limits and
 	// a large dump floods the topic.
 	HistoryCount int `json:"history_count"`
+
+	// SyncCount: how many of each known chat's most recent messages to re-check
+	// every time the MAX session (re)connects — this is what catches up on
+	// messages sent while the service (or the machine) was off, since live WS
+	// pushes only ever cover messages sent while actually connected. Already
+	// delivered messages are skipped (dedup via the Seen set), so this can be
+	// generous; 0 = off (no catch-up resync on reconnect).
+	SyncCount int `json:"sync_count"`
+
+	// MaxAppVersion overrides the appVersion sent to MAX in INIT (empty = built-in
+	// default), e.g. to match the current web.max.ru version.
+	MaxAppVersion string `json:"max_app_version"`
+
+	// MaxBinary (default on) selects the binary msgpack transport the
+	// web client uses; false = legacy JSON transport, where MAX hides polls behind a
+	// bare UNSUPPORTED attach (over binary they arrive in full).
+	MaxBinary *bool `json:"max_binary,omitempty"` // nil (absent) = on
+
+	// Dinner: сайт обедов (dinner.016.help). Мост сам опрашивает сайт и
+	// отправляет готовые сообщения в группу MAX (внешний IP не нужен).
+	// Выключено, пока не заданы все три поля.
+	DinnerURL     string `json:"dinner_url"`      // https://dinner.016.help
+	DinnerToken   string `json:"dinner_token"`    // токен из админки сайта
+	DinnerChatID  int64  `json:"dinner_chat_id"`  // id группы MAX (ключи chat_topic в state.json)
+	DinnerPollSec int    `json:"dinner_poll_sec"` // период опроса, по умолчанию 30
 }
 
 // Default values.
@@ -107,6 +132,15 @@ func load(path string) (*Config, error) {
 	}
 	if cfg.HistoryCount > 200 {
 		cfg.HistoryCount = 200 // hard cap to avoid flooding / rate limits
+	}
+	if cfg.SyncCount == 0 {
+		cfg.SyncCount = 200 // generous catch-up window; dedup makes re-checking cheap
+	}
+	if cfg.SyncCount < 0 {
+		cfg.SyncCount = 0
+	}
+	if cfg.SyncCount > 200 {
+		cfg.SyncCount = 200 // matches GET_HISTORY's own practical page-size ceiling
 	}
 	return cfg, nil
 }

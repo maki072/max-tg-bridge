@@ -6,6 +6,8 @@ import (
 	"image/jpeg"
 	"io"
 	"net/http"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"golang.org/x/image/webp"
@@ -77,4 +79,33 @@ func webpToJPEG(data []byte) ([]byte, error) {
 		return nil, err
 	}
 	return out.Bytes(), nil
+}
+
+// audioExt picks a file extension for downloaded audio from its Content-Type
+// (MAX's voice URLs carry no file name).
+func audioExt(contentType string) string {
+	ct := strings.ToLower(contentType)
+	switch {
+	case strings.Contains(ct, "ogg"), strings.Contains(ct, "opus"):
+		return ".ogg"
+	case strings.Contains(ct, "webm"):
+		return ".webm"
+	case strings.Contains(ct, "mpeg"), strings.Contains(ct, "mp3"):
+		return ".mp3"
+	case strings.Contains(ct, "mp4"), strings.Contains(ct, "m4a"), strings.Contains(ct, "aac"):
+		return ".m4a"
+	case strings.Contains(ct, "wav"):
+		return ".wav"
+	}
+	return ".ogg"
+}
+
+// isAudioFile reports whether a file name looks like a playable audio file
+// Telegram's sendAudio understands.
+func isAudioFile(name string) bool {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".mp3", ".m4a", ".ogg", ".oga", ".opus", ".flac", ".wav", ".aac":
+		return true
+	}
+	return false
 }

@@ -23,13 +23,36 @@ type Store struct {
 	Seen      []string        `json:"seen"`       // recent message ids (dedupe)
 	seenSet   map[string]bool `json:"-"`
 
+	// LastSync is a per-chat watermark: the timestamp (ms) of the newest MAX
+	// message already delivered to Telegram for that chat, whether via a live
+	// push or a history backfill. Unlike Seen (bounded, so old entries get
+	// evicted under enough churn), this never shrinks, so a history resync can
+	// always tell "already delivered" from "genuinely new" without depending on
+	// what's still left in the Seen ring buffer.
+	LastSync map[string]int64 `json:"last_sync"` // maxChatID -> newest delivered message time (ms)
+
 	// MsgLinks is a bounded, bidirectional map between a MAX message
 	// (chatID+messageID) and the Telegram message that mirrors it, used for
 	// reactions, replies, edits and deletes travelling in either direction.
 	MsgLinks []MsgLink      `json:"msg_links"`
 	byMax    map[string]int `json:"-"` // "maxChatID:maxMsgID" -> index into MsgLinks
 	byTg     map[int64]int  `json:"-"` // tgMsgID -> index into MsgLinks
+
+	// Polls are MAX polls mirrored into Telegram (see polls.go).
+	Polls []PollRec `json:"polls"`
+
+	// Banned are muted MAX chats (maxChatID -> title at the time): their
+	// messages are not mirrored and they get no topic until unbanned.
+	Banned map[string]string `json:"banned"`
+	// Titles remembers each mirrored chat's name (maxChatID -> title) so the
+	// panel can list chats readably.
+	Titles map[string]string `json:"titles"`
 }
+
+// PendingPrefix marks a ChatTopic entry for a MAX user we have no dialog with
+// yet ("pending:<userId>"): the topic exists, and the first message written in
+// it opens the dialog (see Bridge.openDialog).
+const PendingPrefix = "pending:"
 
 // MsgLink records one bridged message: a MAX (chatID,messageID) paired with
 // the Telegram message (in the group's topic) that mirrors it.
@@ -51,6 +74,9 @@ func Load(path string) (*Store, error) {
 		seenSet:   make(map[string]bool),
 		byMax:     make(map[string]int),
 		byTg:      make(map[int64]int),
+		LastSync:  make(map[string]int64),
+		Banned:    make(map[string]string),
+		Titles:    make(map[string]string),
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -64,6 +90,15 @@ func Load(path string) (*Store, error) {
 	}
 	if s.ChatTopic == nil {
 		s.ChatTopic = make(map[string]int)
+	}
+	if s.LastSync == nil {
+		s.LastSync = make(map[string]int64)
+	}
+	if s.Banned == nil {
+		s.Banned = make(map[string]string)
+	}
+	if s.Titles == nil {
+		s.Titles = make(map[string]string)
 	}
 	s.seenSet = make(map[string]bool, len(s.Seen))
 	for _, id := range s.Seen {
@@ -220,6 +255,138 @@ func (s *Store) SetTopic(maxChatID string, threadID int) {
 	defer s.mu.Unlock()
 	s.ChatTopic[maxChatID] = threadID
 	_ = s.save()
+}
+
+// RemoveChat forgets a MAX chat entirely: its topic mapping, resync watermark,
+// remembered title and message links. Returns the thread id it had (0 if none).
+func (s *Store) RemoveChat(maxChatID string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	thread := s.ChatTopic[maxChatID]
+	delete(s.ChatTopic, maxChatID)
+	delete(s.LastSync, maxChatID)
+	delete(s.Titles, maxChatID)
+	kept := s.MsgLinks[:0]
+	for _, l := range s.MsgLinks {
+		if l.MaxChatID != maxChatID {
+			kept = append(kept, l)
+		}
+	}
+	s.MsgLinks = kept
+	s.rebuildMsgIndex()
+	_ = s.save()
+	return thread
+}
+
+// MoveTopic re-keys a topic mapping (a "pending:<userId>" entry becoming the
+// real MAX chat id once the dialog exists), carrying the title along.
+func (s *Store) MoveTopic(oldKey, newKey string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	thread, ok := s.ChatTopic[oldKey]
+	if !ok {
+		return
+	}
+	delete(s.ChatTopic, oldKey)
+	s.ChatTopic[newKey] = thread
+	if t := s.Titles[oldKey]; t != "" {
+		delete(s.Titles, oldKey)
+		s.Titles[newKey] = t
+	}
+	_ = s.save()
+}
+
+// SetTitle remembers a chat's display name.
+func (s *Store) SetTitle(maxChatID, title string) {
+	if title == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Titles[maxChatID] != title {
+		s.Titles[maxChatID] = title
+		_ = s.save()
+	}
+}
+
+// Title returns a remembered chat name ("" if unknown).
+func (s *Store) Title(maxChatID string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Titles[maxChatID]
+}
+
+// Ban mutes a MAX chat.
+func (s *Store) Ban(maxChatID, title string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Banned[maxChatID] = title
+	_ = s.save()
+}
+
+// Unban lifts a mute; reports whether the chat was muted.
+func (s *Store) Unban(maxChatID string) (title string, was bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	title, was = s.Banned[maxChatID]
+	if was {
+		delete(s.Banned, maxChatID)
+		_ = s.save()
+	}
+	return title, was
+}
+
+// IsBanned reports whether a MAX chat is muted.
+func (s *Store) IsBanned(maxChatID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.Banned[maxChatID]
+	return ok
+}
+
+// Bans returns a snapshot of the muted chats (maxChatID -> title).
+func (s *Store) Bans() map[string]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]string, len(s.Banned))
+	for k, v := range s.Banned {
+		out[k] = v
+	}
+	return out
+}
+
+// AllTopics returns a snapshot of the MAX chat -> tg thread id mapping, for
+// re-syncing every known chat's history (e.g. after a reconnect).
+func (s *Store) AllTopics() map[string]int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]int, len(s.ChatTopic))
+	for k, v := range s.ChatTopic {
+		out[k] = v
+	}
+	return out
+}
+
+// LastSyncTime returns the newest MAX message time (ms) already delivered for
+// a chat, or 0 if none is recorded yet.
+func (s *Store) LastSyncTime(maxChatID string) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.LastSync[maxChatID]
+}
+
+// BumpLastSync advances the stored watermark for a chat to t, unless t is not
+// newer than what's already recorded (the watermark never moves backwards).
+func (s *Store) BumpLastSync(maxChatID string, t int64) {
+	if t <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if t > s.LastSync[maxChatID] {
+		s.LastSync[maxChatID] = t
+		_ = s.save()
+	}
 }
 
 // ChatByTopic returns the MAX chat id mapped to a tg thread id.

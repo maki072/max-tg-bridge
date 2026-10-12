@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -12,9 +13,11 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -165,6 +168,8 @@ type Client struct {
 	origin    string
 	phone     string
 	forceOp   int
+	binary    atomic.Bool // speak the binary msgpack transport (ver=10) instead of JSON
+	binFails  int         // consecutive binary sessions that died before LOGIN (see session)
 	deviceID  string
 	token     string
 	userAgent string
@@ -189,6 +194,8 @@ type Client struct {
 	onMessage  func(IncomingMessage)
 	onReaction func(IncomingReaction)
 	onDelete   func(IncomingDelete)
+	onConnect  func() // called after every successful LOGIN (initial connect AND every reconnect)
+	onStatus   func(connected bool)
 	saveToken  func(deviceID, token, userAgent, cookie string)
 	loadToken  func() (deviceID, token, cookie string)
 	readCode   func() string
@@ -202,6 +209,8 @@ type Client struct {
 
 	debugMu  sync.Mutex
 	debugLog []string
+
+	pause pauseState // see pause.go
 }
 
 type Options struct {
@@ -212,10 +221,23 @@ type Options struct {
 	UserAgent   string
 	Cookie      string
 	ForceOpcode int
-	AllowSMS    bool
-	OnMessage   func(IncomingMessage)
-	OnReaction  func(IncomingReaction)
-	OnDelete    func(IncomingDelete)
+	// Binary switches the WebSocket to the binary msgpack transport web.max.ru
+	// itself uses (see binproto.go) — needed to receive polls in full.
+	Binary     bool
+	AllowSMS   bool
+	OnMessage  func(IncomingMessage)
+	OnReaction func(IncomingReaction)
+	OnDelete   func(IncomingDelete)
+	// OnConnect, if set, is called (in its own goroutine) after every successful
+	// LOGIN — the initial connect AND every subsequent reconnect. Use it to
+	// re-sync chat history: a live WS session only ever delivers messages sent
+	// while it is actually connected, so anything sent while disconnected (the
+	// service or the machine was off, a network blip, a token refresh) needs an
+	// explicit catch-up pass, which this is the hook for.
+	OnConnect func()
+	// OnStatus, if set, is called whenever the connection flips between
+	// connected and disconnected (never on a repeated state). It must not block.
+	OnStatus    func(connected bool)
 	SaveToken   func(deviceID, token, userAgent, cookie string)
 	LoadToken   func() (deviceID, token, cookie string)
 	ReadSMSCode func() string
@@ -224,6 +246,16 @@ type Options struct {
 }
 
 func New(o Options) *Client {
+	c := newClient(o)
+	c.binary.Store(o.Binary)
+	return c
+}
+
+// Binary reports whether the current session speaks the binary transport
+// (false after an automatic fallback to JSON, see session).
+func (c *Client) Binary() bool { return c.binary.Load() }
+
+func newClient(o Options) *Client {
 	return &Client{
 		url:         o.URL,
 		origin:      "https://web.max.ru",
@@ -244,6 +276,8 @@ func New(o Options) *Client {
 		onMessage:   o.OnMessage,
 		onReaction:  o.OnReaction,
 		onDelete:    o.OnDelete,
+		onConnect:   o.OnConnect,
+		onStatus:    o.OnStatus,
 		saveToken:   o.SaveToken,
 		loadToken:   o.LoadToken,
 		readCode:    o.ReadSMSCode,
@@ -258,8 +292,13 @@ func (c *Client) Run() {
 	go c.deleteLoop()
 	attempt := 0
 	for {
+		c.waitWhilePaused()
 		start := time.Now()
 		err := c.sessionSafe()
+		if errors.Is(err, errPaused) || c.Paused() {
+			attempt = 0
+			continue // a deliberate disconnect, not a failure — no backoff, no log noise
+		}
 		// A session that stayed up for a while was healthy — reset the backoff so
 		// a flaky-but-working link reconnects promptly instead of ramping to 30s.
 		if time.Since(start) > 60*time.Second {
@@ -321,12 +360,21 @@ func (c *Client) session() (sessErr error) {
 	// Firefox User-Agent and NO cookies. Sending the browser's captured Edge UA or
 	// its web.max.ru cookies makes the WAF drop the socket (1006 EOF) — the probe
 	// in Diagnose (no cookie, default UA) connects and gets an INIT reply fine.
-	conn, _, err := maxDialer.Dial(c.url, http_headers(c.origin, "", ""))
+	wsURL := c.url
+	if c.binary.Load() {
+		wsURL = BinaryWSURL // the binary transport lives on a different host
+	}
+	conn, _, err := maxDialer.Dial(wsURL, http_headers(c.origin, "", ""))
 	if err != nil {
-		return fmt.Errorf("dial: %w", err)
+		return fmt.Errorf("dial %s: %w", wsURL, err)
 	}
 	defer conn.Close()
+	c.writeMu.Lock()
 	c.conn = conn
+	c.writeMu.Unlock()
+	if c.Paused() { // paused while we were dialing
+		return errPaused
+	}
 
 	c.pendMu.Lock()
 	c.pending = make(map[int]chan *Frame)
@@ -347,6 +395,7 @@ func (c *Client) session() (sessErr error) {
 	}()
 
 	if err := c.init(); err != nil {
+		c.noteBinaryFailure(err)
 		return fmt.Errorf("init: %w", err)
 	}
 	log.Printf("[max] INIT ok")
@@ -358,11 +407,27 @@ func (c *Client) session() (sessErr error) {
 	}
 
 	if err := c.login(); err != nil {
+		c.noteBinaryFailure(err)
 		c.token = ""
 		return fmt.Errorf("login: %w", err)
 	}
-	log.Printf("[max] LOGIN ok (selfID=%d); connected", c.selfID)
+	c.binFails = 0
+	transport := "JSON"
+	if c.binary.Load() {
+		transport = "binary (msgpack)"
+	}
+	log.Printf("[max] LOGIN ok (selfID=%d); connected, transport=%s", c.selfID, transport)
 	c.setStatus(true, "")
+	if c.onConnect != nil {
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[max] onConnect panic: %v", r)
+				}
+			}()
+			c.onConnect()
+		}()
+	}
 
 	done := make(chan struct{})
 	go c.heartbeat(done)
@@ -370,6 +435,24 @@ func (c *Client) session() (sessErr error) {
 	err = <-readErr
 	close(done)
 	return err
+}
+
+// noteBinaryFailure counts binary sessions that died before LOGIN completed;
+// after two in a row the client falls back to the JSON transport for good
+// (until restart), so a server-side change to the binary protocol can't keep
+// the bridge offline — it just loses full polls again.
+func (c *Client) noteBinaryFailure(err error) {
+	// A server error reply means the binary frame was understood (e.g. an
+	// expired token) — only silent drops/timeouts point at the transport.
+	if !c.binary.Load() || strings.Contains(err.Error(), "server error") {
+		return
+	}
+	c.binFails++
+	log.Printf("[max] binary transport: session failed before LOGIN (%d/2): %v", c.binFails, err)
+	if c.binFails >= 2 {
+		c.binary.Store(false)
+		log.Printf("[max] binary transport: FALLING BACK TO JSON — polls will arrive as placeholders until restart. Please send this log to the developer.")
+	}
 }
 
 // mergeRefresh applies a browser-grabbed session WITHOUT adopting the browser's
@@ -400,11 +483,15 @@ func (c *Client) mergeRefresh(browserDeviceID, token, userAgent, cookie string) 
 
 func (c *Client) setStatus(connected bool, lastErr string) {
 	c.statMu.Lock()
+	changed := c.connected != connected
 	c.connected = connected
 	if lastErr != "" {
 		c.lastErr = lastErr
 	}
 	c.statMu.Unlock()
+	if changed && c.onStatus != nil {
+		c.onStatus(connected)
+	}
 }
 
 func (c *Client) Status() (connected bool, selfID int64, lastErr string) {
@@ -477,8 +564,10 @@ func (c *Client) init() error {
 	// (defaultUserAgent) and stamp in the real captured browser UA if we have it.
 	// Keep the INIT userAgent consistent with the Firefox handshake (do not stamp
 	// in the captured Edge UA) — this matches the Diagnose probe that gets ACKed.
+	ua := defaultUserAgent()
+	log.Printf("[max] INIT appVersion=%q deviceType=%s binary=%t", ua.AppVersion, ua.DeviceType, c.binary.Load())
 	_, err := c.request(OpInit, map[string]any{
-		"userAgent": defaultUserAgent(),
+		"userAgent": ua,
 		"deviceId":  c.deviceID,
 	}, 15*time.Second)
 	return err
@@ -652,15 +741,21 @@ func (c *Client) History(chatID int64, count int) []IncomingMessage {
 			Outgoing:    sid != 0 && sid == c.selfID,
 			Forwarded:   forwarded,
 			ReplyToID:   replyToID,
+			Time:        m.Time,
 		}
-		c.resolveAttachments(chatID, im.MessageID, im.Attachments)
+		// Attachment URLs are NOT resolved here: a resync re-reads history on
+		// every reconnect and most of it is already delivered, so the caller
+		// resolves (ResolveAttachments) only what it actually posts.
 		c.enrich(&im)
 		out = append(out, im)
 	}
-	// GET_HISTORY returns newest-first; reverse to chronological order.
-	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
-		out[i], out[j] = out[j], out[i]
-	}
+	// Sort chronologically (oldest-first) by the message's own Time rather than
+	// assuming a fixed wire order — GET_HISTORY's actual ordering here is
+	// reverse-engineered and unconfirmed (a blind reverse-in-place previously
+	// used here produced newest-first output live, backwards from what a
+	// backfill needs), so sorting by real timestamp is the only way to be sure
+	// regardless of whatever order the server happens to send.
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Time < out[j].Time })
 	return out
 }
 
@@ -857,8 +952,15 @@ func (c *Client) SendVoice(chatID int64, data []byte, durationMS int64, caption 
 // sendAttachMessage posts a single-attachment message (photo/video/voice/file)
 // via MSG_SEND, optionally as a reply, and returns the created message id.
 func (c *Client) sendAttachMessage(chatID int64, caption, replyToMaxID string, attach map[string]any) (string, error) {
+	return c.sendAttach(chatID, caption, replyToMaxID, attach)
+}
+
+// sendAttach is sendAttachMessage with the text as `any`, so attach-only
+// messages (location, contact) can send a JSON null — MAX wants null there,
+// not an empty string.
+func (c *Client) sendAttach(chatID int64, text any, replyToMaxID string, attach map[string]any) (string, error) {
 	msg := map[string]any{
-		"text": caption, "cid": time.Now().UnixNano(), "elements": []any{},
+		"text": text, "cid": time.Now().UnixNano(), "elements": []any{},
 		"attaches": []map[string]any{attach},
 	}
 	if replyToMaxID != "" {
@@ -895,6 +997,13 @@ func msgIDArg(id string) any {
 // resolveAttachments fills in URL for any attachment that only carries a lazy
 // Resolve* id (a VIDEO/FILE/AUDIO attach MAX sent without a direct URL). MUST
 // be called off the read loop — it makes MAX requests and blocks for replies.
+// ResolveAttachments fills in the media URLs of a message returned by History
+// (which leaves them unresolved). Makes MAX requests; never call it on the
+// read loop.
+func (c *Client) ResolveAttachments(m *IncomingMessage) {
+	c.resolveAttachments(m.ChatID, m.MessageID, m.Attachments)
+}
+
 func (c *Client) resolveAttachments(chatID int64, messageID string, atts []Attachment) {
 	for i := range atts {
 		if atts[i].URL != "" || atts[i].ResolveKind == "" {
@@ -998,7 +1107,8 @@ func (c *Client) getAudioURL(chatID int64, messageID string, audioID int64) stri
 	if json.Unmarshal(resp.Payload, &r) != nil {
 		return ""
 	}
-	for _, key := range []string{"url", "URL"} {
+	// Confirmed live: the response is {"opus":"https://a.oneme.ru/audio?..."}.
+	for _, key := range []string{"url", "URL", "opus"} {
 		if v, ok := r[key].(string); ok && v != "" {
 			return v
 		}
@@ -1234,6 +1344,9 @@ func (c *Client) SendMessageReply(chatID int64, text string, replyToMaxID string
 func (c *Client) request(opcode int, payload any, timeout time.Duration) (*Frame, error) {
 	c.seqMu.Lock()
 	c.seq++
+	if c.seq > 0xFFFF { // the binary header carries seq as u16
+		c.seq = 1
+	}
 	seq := c.seq
 	c.seqMu.Unlock()
 	ch := make(chan *Frame, 1)
@@ -1263,23 +1376,36 @@ func (c *Client) request(opcode int, payload any, timeout time.Duration) (*Frame
 }
 
 func (c *Client) writeFrame(f Frame) error {
-	raw, _ := json.Marshal(f)
+	msgType := websocket.TextMessage
+	raw, err := json.Marshal(f)
+	if c.binary.Load() {
+		msgType = websocket.BinaryMessage
+		raw, err = encodeBinFrame(f)
+	}
+	if err != nil {
+		return err
+	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	if c.conn == nil {
 		return fmt.Errorf("not connected")
 	}
-	return c.conn.WriteMessage(websocket.TextMessage, raw)
+	return c.conn.WriteMessage(msgType, raw)
 }
 
 func (c *Client) readLoop() error {
 	for {
-		_, data, err := c.conn.ReadMessage()
+		msgType, data, err := c.conn.ReadMessage()
 		if err != nil {
 			return err
 		}
 		var f Frame
-		if err := json.Unmarshal(data, &f); err != nil {
+		if msgType == websocket.BinaryMessage {
+			if f, err = decodeBinFrame(data); err != nil {
+				log.Printf("[max] bad binary frame: %v", err)
+				continue
+			}
+		} else if err := json.Unmarshal(data, &f); err != nil {
 			continue
 		}
 		if f.Cmd == CmdAck || f.Cmd == CmdError {
@@ -1350,12 +1476,31 @@ func (c *Client) tryMessage(f Frame) bool {
 	if pm.Message == nil {
 		return false
 	}
+	chatID := numToInt64(pm.ChatID)
+	// A chat deleted in MAX arrives as a CONTROL "Чат закрыт" marker — hand it
+	// on so the bridge can drop the chat's topic.
+	if chatID != 0 && isChatClosed(pm.Message.Attaches) {
+		select {
+		case c.deliver <- IncomingMessage{ChatID: chatID, ChatClosed: true}:
+		default:
+			log.Printf("[max] deliver queue full; dropping chat-closed marker for chat %d", chatID)
+		}
+		return true
+	}
+	// A repeat push of an existing id with status REMOVED is a deletion.
+	if chatID != 0 && pm.Message.Status == "REMOVED" && pm.Message.ID != "" {
+		select {
+		case c.deletes <- IncomingDelete{ChatID: chatID, MessageIDs: []string{pm.Message.ID.String()}}:
+		default:
+			log.Printf("[max] delete queue full; dropping REMOVED push for chat %d", chatID)
+		}
+		return true
+	}
 	text, attachments, forwarded, replyToID := parseLink(pm.Message.Link, pm.Message.Text, toAttachments(pm.Message.Attaches))
 	// Skip pure service pushes (no text AND no media); keep media-only messages.
 	if strings.TrimSpace(text) == "" && len(attachments) == 0 {
 		return false
 	}
-	chatID := numToInt64(pm.ChatID)
 	senderID := numToInt64(pm.Message.Sender)
 	if chatID == 0 {
 		return false
@@ -1372,6 +1517,7 @@ func (c *Client) tryMessage(f Frame) bool {
 		Outgoing:    senderID != 0 && senderID == c.selfID,
 		Forwarded:   forwarded,
 		ReplyToID:   replyToID,
+		Time:        pm.Message.Time,
 	}
 	// Hand off to the delivery worker (never block or make MAX requests on the
 	// read loop — that would deadlock, since replies arrive on this same loop).
@@ -1473,8 +1619,10 @@ func (c *Client) deleteLoop() {
 // preserving order.
 func (c *Client) deliverLoop() {
 	for msg := range c.deliver {
-		c.resolveAttachments(msg.ChatID, msg.MessageID, msg.Attachments)
-		c.enrich(&msg)
+		if !msg.ChatClosed { // a closed chat has nothing to resolve or look up
+			c.resolveAttachments(msg.ChatID, msg.MessageID, msg.Attachments)
+			c.enrich(&msg)
+		}
 		if c.onMessage != nil {
 			func() {
 				defer func() {
