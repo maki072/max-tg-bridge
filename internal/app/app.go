@@ -11,6 +11,7 @@ import (
 	"maxtg/internal/bridge"
 	"maxtg/internal/browsergrab"
 	"maxtg/internal/config"
+	"maxtg/internal/dinner"
 	"maxtg/internal/maxapi"
 	"maxtg/internal/store"
 	"maxtg/internal/tg"
@@ -64,6 +65,7 @@ func (p *Program) run() {
 		log.Printf("[app] auto token refresh via browser CDP at %s", cdp)
 	}
 
+	maxapi.AppVersionOverride = p.cfg.MaxAppVersion
 	maxClient := maxapi.New(maxapi.Options{
 		URL:         p.cfg.MaxWSURL,
 		Phone:       p.cfg.Phone,
@@ -72,11 +74,13 @@ func (p *Program) run() {
 		UserAgent:   userAgent,
 		Cookie:      cookie,
 		ForceOpcode: p.cfg.IncomingOpcode,
+		Binary:      p.cfg.MaxBinary == nil || *p.cfg.MaxBinary, // binary unless explicitly disabled
 		AllowSMS:    false,
 		OnMessage: func(m maxapi.IncomingMessage) {
 			defer func() {
 				if r := recover(); r != nil {
 					log.Printf("[app] recovered from panic handling MAX message: %v", r)
+					br.ReportPanic("сообщение из MAX", r)
 				}
 			}()
 			br.OnMaxMessage(m)
@@ -89,6 +93,24 @@ func (p *Program) run() {
 			}()
 			br.OnMaxReaction(r)
 		},
+		OnDelete: func(d maxapi.IncomingDelete) {
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Printf("[app] recovered from panic handling MAX delete: %v", rec)
+				}
+			}()
+			br.OnMaxDelete(d)
+		},
+		OnConnect: func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Printf("[app] recovered from panic handling MAX connect: %v", rec)
+					br.ReportPanic("синхронизация после подключения", rec)
+				}
+			}()
+			br.SyncAllChats()
+		},
+		OnStatus:  func(connected bool) { br.OnMaxStatus(connected) },
 		SaveToken: func(d, t, ua, ck string) { st.SetCredentials(d, t, ua, ck) },
 		LoadToken: func() (string, string, string) { d, t, _, ck := st.GetCredentials(); return d, t, ck },
 		Refresh:   refresh,
@@ -97,6 +119,17 @@ func (p *Program) run() {
 
 	log.Printf("[app] bridge starting (tg group %d)", p.cfg.TelegramGroupID)
 	go maxClient.Run()
+	go br.RunPollRefresher()
+	if p.cfg.DinnerURL != "" && p.cfg.DinnerToken != "" {
+		if p.cfg.DinnerChatID == 0 {
+			log.Printf("[dinner] dinner_chat_id не задан — автоотправка обедов выключена")
+		} else {
+			go dinner.Run(dinner.Options{
+				URL: p.cfg.DinnerURL, Token: p.cfg.DinnerToken, ChatID: p.cfg.DinnerChatID,
+				Interval: time.Duration(p.cfg.DinnerPollSec) * time.Second,
+			}, maxClient)
+		}
+	}
 	br.RunTelegram()
 }
 

@@ -30,10 +30,30 @@ type Bridge struct {
 	authCapChan  chan string
 	authMu       sync.Mutex
 	authActive   atomic.Bool // true while an SMS auth flow is waiting for input
+	syncing      atomic.Bool // true while SyncAllChats is running (prevents overlap)
+
+	// syncGate orders live delivery against SyncAllChats: a resync holds the
+	// write side for its whole pass, so no live MAX message can be posted into
+	// any topic (landing ahead of, or interleaved with, that chat's own
+	// not-yet-posted catch-up messages) while history is being caught up. Live
+	// delivery takes the read side, so unrelated traffic still flows normally
+	// whenever no resync is in progress.
+	syncGate sync.RWMutex
+
+	// dialogMu serializes everything that creates or re-keys a chat's topic
+	// (a new MAX chat's first message, opening a dialog from Telegram, creating a
+	// group), so the echo of our own action can never open a duplicate topic.
+	dialogMu sync.Mutex
+
+	al alertState // failure notifications (alerts.go)
+	kb kbRegistry // pressable MAX bot buttons (keyboard.go)
+
+	promptMu sync.Mutex
+	prompts  map[int64]prompt // admin user id -> panel question awaiting an answer
 }
 
 func New(max *maxapi.Client, bot *tg.Bot, st *store.Store, cfg *config.Config, configPath string) *Bridge {
-	return &Bridge{
+	b := &Bridge{
 		max:        max,
 		bot:        bot,
 		st:         st,
@@ -44,6 +64,12 @@ func New(max *maxapi.Client, bot *tg.Bot, st *store.Store, cfg *config.Config, c
 		authCodeChan: make(chan string, 1),
 		authCapChan:  make(chan string, 1),
 	}
+	// If MAX still isn't up a couple of minutes after start (no token, bad
+	// token, no network), say so rather than sitting silent.
+	b.al.mu.Lock()
+	b.armDownTimerLocked(2 * time.Minute)
+	b.al.mu.Unlock()
+	return b
 }
 
 // drainString removes any stale queued value from a buffered channel.
@@ -64,28 +90,57 @@ func (b *Bridge) OnMaxMessage(m maxapi.IncomingMessage) {
 	if b.bot.GroupID() == 0 {
 		return
 	}
+	chatKey := strconv.FormatInt(m.ChatID, 10)
+	if m.ChatClosed { // the chat was deleted in MAX
+		b.onChatClosed(chatKey)
+		return
+	}
+	if b.st.IsBanned(chatKey) { // muted chat: no mirror, no topic
+		return
+	}
+	if m.Time > 0 {
+		b.st.BumpLastSync(chatKey, m.Time) // advance the resync watermark regardless of dedup outcome below
+	}
 	if m.MessageID != "" && b.st.SeenAndMark("max:"+m.MessageID) {
 		return
 	}
 
-	chatKey := strconv.FormatInt(m.ChatID, 10)
+	// Wait out any resync in progress for this chat's topic (see syncGate) so
+	// this live message can never jump ahead of, or interleave with, a
+	// catch-up backfill that's still being posted.
+	b.syncGate.RLock()
+	defer b.syncGate.RUnlock()
+
 	threadID, ok := b.st.Topic(chatKey)
 	if !ok {
-		id, err := b.bot.CreateForumTopic(m.ChatTitle)
-		if err != nil {
-			log.Printf("[bridge] createForumTopic for %q failed: %v", m.ChatTitle, err)
-			b.notify(fmt.Sprintf("⚠️ Failed to create a topic for MAX chat %q: %v", m.ChatTitle, err))
-			return
+		// dialogMu: a topic being opened/created by an admin action (new dialog,
+		// new group) must be finished and registered before we decide none exists.
+		b.dialogMu.Lock()
+		if threadID, ok = b.st.Topic(chatKey); !ok {
+			id, err := b.bot.CreateForumTopic(m.ChatTitle)
+			if err != nil {
+				b.dialogMu.Unlock()
+				log.Printf("[bridge] createForumTopic for %q failed: %v", m.ChatTitle, err)
+				b.alert("topic-create", fmt.Sprintf("⚠️ Не удалось создать тему для чата MAX %q: %v", m.ChatTitle, err), 10*time.Minute)
+				return
+			}
+			threadID = id
+			b.st.SetTopic(chatKey, threadID)
+			b.st.SetTitle(chatKey, m.ChatTitle)
+			b.dialogMu.Unlock()
+			b.onNewTopic(threadID, m.ChatID) // avatar + history backfill
+		} else {
+			b.dialogMu.Unlock()
 		}
-		threadID = id
-		b.st.SetTopic(chatKey, threadID)
-		b.onNewTopic(threadID, m.ChatID) // avatar + history backfill
 	}
+	b.st.SetTitle(chatKey, m.ChatTitle)
 
 	b.postMessage(threadID, m)
 }
 
-// postMessage renders one MAX message into a topic (header + text + media).
+// postMessage renders one MAX message into a topic (header + text + media),
+// then records the tg<->max message link so later reactions/replies/deletes
+// (in either direction) can find their way back to this message.
 func (b *Bridge) postMessage(threadID int, m maxapi.IncomingMessage) {
 	prefix := ""
 	if m.Outgoing {
@@ -93,85 +148,400 @@ func (b *Bridge) postMessage(threadID int, m maxapi.IncomingMessage) {
 	}
 	if m.Forwarded {
 		prefix += "↪ "
+	} else if m.ReplyToID != "" {
+		prefix += "↩️ "
 	}
 	header := prefix + m.SenderName
-	if strings.TrimSpace(m.Text) != "" {
-		if err := b.bot.SendToTopic(threadID, header+":\n"+m.Text); err != nil {
-			log.Printf("[bridge] sendToTopic %d failed: %v", threadID, err)
+	chatKey := strconv.FormatInt(m.ChatID, 10)
+
+	var replyToTg int64
+	if m.ReplyToID != "" {
+		if link, ok := b.st.TgByMax(chatKey, m.ReplyToID); ok {
+			replyToTg = link.TgMsgID
 		}
 	}
+
+	linked := false
+	link := func(tgID int64) {
+		if !linked && tgID != 0 {
+			b.st.LinkMessages(chatKey, m.MessageID, tgID, threadID)
+			linked = true
+		}
+	}
+
+	// A bot keyboard rides on the message's text when there is one; otherwise it
+	// goes out as a message of its own (below).
+	var kbMarkup *tg.InlineKeyboardMarkup
 	for _, att := range m.Attachments {
-		b.forwardAttachment(threadID, header, att)
+		if att.Kind == "keyboard" && kbMarkup == nil {
+			kbMarkup = b.keyboardMarkup(att, m.ChatID)
+		}
+	}
+	kbOnText := false
+	if strings.TrimSpace(m.Text) != "" {
+		body := header + ":\n" + m.Text
+		tgID, err := b.bot.SendToTopicMarkup(threadID, body, replyToTg, kbMarkup)
+		if err != nil && kbMarkup != nil {
+			// Telegram can refuse a keyboard (e.g. a URL it dislikes): the text
+			// matters more, so resend it plain and fall back to the text rendering.
+			log.Printf("[bridge] sendToTopic %d with keyboard failed: %v; retrying without it", threadID, err)
+			kbMarkup = nil
+			tgID, err = b.bot.SendToTopic(threadID, body, replyToTg)
+		} else if err == nil && kbMarkup != nil {
+			kbOnText = true
+		}
+		if err != nil {
+			log.Printf("[bridge] sendToTopic %d failed: %v", threadID, err)
+			b.alert("tg-send", "⚠️ Не удалось отправить сообщение из MAX в Telegram: "+shortErr(err), 10*time.Minute)
+		}
+		link(tgID)
+	}
+	for _, att := range m.Attachments {
+		if att.Kind == "share" && att.URL != "" && strings.Contains(m.Text, att.URL) {
+			continue // MAX's preview of a link already in the text; Telegram previews it itself
+		}
+		if att.Kind == "keyboard" && kbMarkup != nil {
+			if !kbOnText { // no text to carry it: post the buttons on their own
+				tgID, err := b.bot.SendToTopicMarkup(threadID, header+":\n⌨️ Кнопки бота", replyToTg, kbMarkup)
+				if err != nil {
+					log.Printf("[bridge] keyboard send to topic %d failed: %v", threadID, err)
+				}
+				link(tgID)
+				kbOnText = true // only the first keyboard is rendered
+			}
+			continue
+		}
+		if att.Kind == "poll" && att.Poll != nil {
+			link(b.postPoll(threadID, header, chatKey, m.MessageID, att.Poll, replyToTg))
+			continue
+		}
+		link(b.forwardAttachment(threadID, header, att, replyToTg))
 	}
 }
 
 // onNewTopic posts the chat avatar and backfills recent history into a new topic.
 func (b *Bridge) onNewTopic(threadID int, chatID int64) {
 	if url := b.max.ChatIcon(chatID); url != "" {
-		b.forwardAttachment(threadID, "🖼", maxapi.Attachment{Kind: "photo", URL: url})
+		b.forwardAttachment(threadID, "🖼", maxapi.Attachment{Kind: "photo", URL: url}, 0)
 	}
-	for _, hm := range b.max.History(chatID, b.cfg.HistoryCount) {
+	b.backfillHistory(threadID, chatID, b.cfg.HistoryCount)
+}
+
+// backfillHistory posts up to count of the chat's most recent MAX messages
+// into threadID, in chronological order, skipping anything at or before the
+// chat's LastSync watermark (already covered by an earlier backfill or live
+// delivery — this is what keeps a repeated resync from re-posting the same
+// old messages once the bounded Seen dedup set has evicted their ids) and,
+// as a second-layer guard, anything still in Seen. Used both when a topic is
+// first created and, via SyncAllChats, to catch an already-mapped chat up
+// after a reconnect. Locking is the caller's responsibility (see syncGate).
+// Returns how many were posted.
+func (b *Bridge) backfillHistory(threadID int, chatID int64, count int) int {
+	chatKey := strconv.FormatInt(chatID, 10)
+	watermark := b.st.LastSyncTime(chatKey)
+	posted := 0
+	var newest int64
+	for _, hm := range b.max.History(chatID, count) {
+		if hm.Time > newest {
+			newest = hm.Time
+		}
+		if watermark > 0 && hm.Time > 0 && hm.Time <= watermark {
+			continue // already covered by a previous sync/live delivery
+		}
 		if hm.MessageID != "" && b.st.SeenAndMark("max:"+hm.MessageID) {
 			continue
 		}
+		b.max.ResolveAttachments(&hm)
 		b.postMessage(threadID, hm)
+		posted++
+	}
+	if newest > 0 {
+		b.st.BumpLastSync(chatKey, newest)
+	}
+	return posted
+}
+
+// SyncAllChats re-checks recent history for every MAX chat that already has a
+// mapped Telegram topic and posts anything not yet delivered. Wired as the
+// MAX client's OnConnect hook (see app.go), it runs after the initial connect
+// AND every reconnect — live WS pushes only ever cover messages sent while
+// the session is actually connected, so this is what recovers anything sent
+// while the service (or the machine) was off. Holds syncGate's write side for
+// the whole pass so no live message can be posted (into any topic) while
+// history is being caught up — otherwise a live message can land ahead of, or
+// interleaved with, its own chat's still-in-flight catch-up batch, which is
+// what makes messages show up out of order. Already-delivered messages are
+// skipped (per-chat watermark, then the Seen set), so a repeated run is a
+// cheap no-op rather than a source of duplicates.
+func (b *Bridge) SyncAllChats() {
+	if b.bot.GroupID() == 0 || b.cfg.SyncCount <= 0 {
+		return
+	}
+	if !b.syncing.CompareAndSwap(false, true) {
+		return // a sync is already in progress (e.g. two reconnects in a row)
+	}
+	defer b.syncing.Store(false)
+
+	b.syncGate.Lock()
+	defer b.syncGate.Unlock()
+
+	topics := b.st.AllTopics()
+	total := 0
+	for chatKey, threadID := range topics {
+		chatID, err := strconv.ParseInt(chatKey, 10, 64)
+		if err != nil {
+			continue
+		}
+		total += b.backfillHistory(threadID, chatID, b.cfg.SyncCount)
+	}
+	if total > 0 {
+		log.Printf("[bridge] sync: backfilled %d missed message(s) across %d chat(s)", total, len(topics))
 	}
 }
 
-// forwardAttachment downloads a MAX media attachment and posts it into the topic.
-func (b *Bridge) forwardAttachment(threadID int, header string, att maxapi.Attachment) {
+// forwardAttachment downloads a MAX media attachment and posts it into the
+// topic, optionally as a native Telegram reply (replyToTg == 0 means none).
+// Returns the id of the Telegram message it posted (0 if none/failed), for
+// tg<->max message linking.
+func (b *Bridge) forwardAttachment(threadID int, header string, att maxapi.Attachment, replyToTg int64) int64 {
 	caption := header + ":"
 	switch att.Kind {
 	case "photo":
 		data, _, err := httpDownload(att.URL, 25*1024*1024)
 		if err != nil {
 			log.Printf("[bridge] photo download failed: %v", err)
-			_ = b.bot.SendToTopic(threadID, caption+" 🖼 "+att.URL)
-			return
+			id, _ := b.bot.SendToTopic(threadID, caption+" 🖼 "+att.URL, replyToTg)
+			return id
 		}
 		// MAX photos are WebP; Telegram sendPhoto needs JPEG/PNG.
 		if jpg, err := webpToJPEG(data); err == nil {
 			data = jpg
 		}
-		if err := b.bot.SendPhoto(threadID, data, caption); err != nil {
+		id, err := b.bot.SendPhoto(threadID, data, caption, replyToTg)
+		if err != nil {
 			log.Printf("[bridge] sendPhoto failed: %v; sending as document", err)
-			_ = b.bot.SendDocument(threadID, data, "photo.jpg", caption)
+			id, _ = b.bot.SendDocument(threadID, data, "photo.jpg", caption, replyToTg)
 		}
+		return id
 	case "file":
 		data, _, err := httpDownload(att.URL, 45*1024*1024)
 		if err != nil {
 			log.Printf("[bridge] file download failed: %v", err)
-			_ = b.bot.SendToTopic(threadID, caption+" 📎 "+att.URL)
-			return
+			id, _ := b.bot.SendToTopic(threadID, caption+" 📎 "+att.URL, replyToTg)
+			return id
 		}
 		name := att.Name
 		if name == "" {
 			name = "file"
 		}
-		if err := b.bot.SendDocument(threadID, data, name, caption); err != nil {
+		// Audio files (music, recordings) go to Telegram's player first.
+		if isAudioFile(name) {
+			if id, err := b.bot.SendAudio(threadID, data, name, caption, replyToTg); err == nil {
+				return id
+			} else {
+				log.Printf("[media] sendAudio failed for %s: %v; sending as a file", name, err)
+			}
+		}
+		id, err := b.bot.SendDocument(threadID, data, name, caption, replyToTg)
+		if err != nil {
 			log.Printf("[bridge] sendDocument failed: %v", err)
 		}
+		return id
 	case "video":
-		// Videos use large signed CDN URLs — post the link (Telegram will preview it).
-		_ = b.bot.SendToTopic(threadID, caption+" 🎥 "+att.URL)
+		// Videos carry a large signed CDN URL. Download it and re-upload so it
+		// plays inside Telegram; fall back to a document, then to posting the
+		// link (video missing / too big for the bot upload limit / fetch error).
+		data, _, tooLarge, err := httpDownloadCapped(att.URL, tgUploadLimit)
+		if att.URL == "" || tooLarge || err != nil || len(data) == 0 {
+			if err != nil {
+				log.Printf("[bridge] video download failed: %v; posting link", err)
+			} else if tooLarge {
+				log.Printf("[bridge] video exceeds %d bytes; posting link", tgUploadLimit)
+			}
+			id, _ := b.bot.SendToTopic(threadID, caption+" 🎥 "+att.URL, replyToTg)
+			return id
+		}
+		name := att.Name
+		if name == "" {
+			name = "video.mp4"
+		}
+		id, err := b.bot.SendVideo(threadID, data, name, caption, replyToTg)
+		if err != nil {
+			log.Printf("[bridge] sendVideo failed: %v; sending as document", err)
+			id, err = b.bot.SendDocument(threadID, data, name, caption, replyToTg)
+			if err != nil {
+				log.Printf("[bridge] sendDocument (video) failed: %v; posting link", err)
+				id, _ = b.bot.SendToTopic(threadID, caption+" 🎥 "+att.URL, replyToTg)
+			}
+		}
+		return id
 	case "voice":
-		// MAX gives us no fetchable URL for voice notes (see toAttachments) —
-		// post a visible placeholder instead of silently dropping the message.
-		_ = b.bot.SendToTopic(threadID, fmt.Sprintf("%s 🎤 Голосовое сообщение (%s) — откройте MAX, чтобы прослушать", caption, formatDuration(att.Duration)))
+		// Voice notes previously had no fetchable URL in most cases (MAX gave
+		// only an internal audioId/token); Client.resolveAttachments now tries
+		// AUDIO_PLAY first, so att.URL is populated whenever that succeeds.
+		// Fall back to the "open MAX" placeholder only if it's still empty.
+		if att.URL == "" {
+			return b.postVoicePlaceholder(threadID, caption, att.Duration, replyToTg)
+		}
+		data, ctype, tooLarge, err := httpDownloadCapped(att.URL, tgUploadLimit)
+		if tooLarge || err != nil || len(data) == 0 {
+			log.Printf("[media] voice %s download failed (err=%v, tooLarge=%t, %d bytes); posting placeholder",
+				formatDuration(att.Duration), err, tooLarge, len(data))
+			return b.postVoicePlaceholder(threadID, caption, att.Duration, replyToTg)
+		}
+		name := att.Name
+		if name == "" {
+			name = "voice" + audioExt(ctype)
+		}
+		// Telegram's sendVoice takes OGG/Opus (also MP3/M4A); anything else
+		// goes to the music player (sendAudio), then as a plain file.
+		id, err := b.bot.SendVoice(threadID, data, caption, replyToTg)
+		if err != nil {
+			log.Printf("[media] sendVoice failed for %s (%s, %d bytes): %v; trying sendAudio", name, ctype, len(data), err)
+			id, err = b.bot.SendAudio(threadID, data, name, caption, replyToTg)
+			if err != nil {
+				log.Printf("[media] sendAudio failed for %s: %v; sending as a file", name, err)
+				id, err = b.bot.SendDocument(threadID, data, name, caption, replyToTg)
+				if err != nil {
+					log.Printf("[media] voice/audio send failed: %v; posting placeholder", err)
+					return b.postVoicePlaceholder(threadID, caption, att.Duration, replyToTg)
+				}
+			}
+		}
+		return id
 	case "poll":
 		text := caption + " 📊 Голосование"
 		if strings.TrimSpace(att.Text) != "" {
 			text += ": " + att.Text
 		}
 		text += " — откройте MAX, чтобы посмотреть варианты и проголосовать"
-		_ = b.bot.SendToTopic(threadID, text)
+		id, _ := b.bot.SendToTopic(threadID, text, replyToTg)
+		return id
+	case "share":
+		text := caption + " 🔗 "
+		if att.Name != "" && att.Name != att.URL {
+			text += att.Name + "\n"
+		}
+		if att.Text != "" && att.Text != att.URL {
+			text += att.Text + "\n"
+		}
+		id, _ := b.bot.SendToTopic(threadID, text+att.URL, replyToTg)
+		return id
+	case "contact":
+		phone := att.Phone
+		if phone == "" && att.ContactID != 0 {
+			phone = b.max.ContactPhone(att.ContactID) // MAX sent only a user reference
+		}
+		if phone != "" {
+			// A real Telegram contact card; the sender line goes first since a
+			// card has no caption, and the card replies to it.
+			headID, herr := b.bot.SendToTopic(threadID, caption+" 👤 Контакт", replyToTg)
+			if herr == nil {
+				first, last, _ := strings.Cut(strings.TrimSpace(att.Name), " ")
+				if !strings.HasPrefix(phone, "+") {
+					phone = "+" + phone
+				}
+				if first == "" {
+					first = phone // Telegram requires a first name
+				}
+				if _, err := b.bot.SendContact(threadID, phone, first, strings.TrimSpace(last), headID); err == nil {
+					return headID
+				} else {
+					log.Printf("[bridge] sendContact failed: %v; posting it as text", err)
+				}
+			}
+		}
+		text := caption + " 👤 Контакт: " + att.Name
+		if phone != "" {
+			text += "\n📞 " + phone
+		} else {
+			text += " (номер скрыт в MAX)"
+		}
+		id, _ := b.bot.SendToTopic(threadID, text, replyToTg)
+		return id
+	case "location":
+		headID, err := b.bot.SendToTopic(threadID, caption+" 📍 Геопозиция", replyToTg)
+		if err != nil {
+			return 0
+		}
+		if _, err := b.bot.SendLocation(threadID, att.Lat, att.Lon, headID); err != nil {
+			log.Printf("[bridge] sendLocation failed: %v; posting coordinates as text", err)
+			_, _ = b.bot.SendToTopic(threadID, fmt.Sprintf("%.6f, %.6f\nhttps://maps.google.com/?q=%.6f,%.6f", att.Lat, att.Lon, att.Lat, att.Lon), headID)
+		}
+		return headID
+	case "sticker":
+		return b.forwardSticker(threadID, caption, att, replyToTg)
+	case "keyboard":
+		id, _ := b.bot.SendToTopic(threadID, caption+" ⌨️ Кнопки бота (нажать можно только в MAX):\n"+att.Text, replyToTg)
+		return id
 	case "other":
+		// MAX substitutes a bare "UNSUPPORTED" attach (no other fields at
+		// all) for several content types it won't describe to a WEB session
+		// — confirmed live for both voice notes and polls, so it's likely a
+		// blanket "can't render this for you" marker rather than one
+		// specific type. Naming it plainly ("UNSUPPORTED") reads like an
+		// internal error to a user; say what's actually going on instead.
+		if att.Name == "UNSUPPORTED" {
+			text := caption + " 📎 Вложение недоступно для этой сессии MAX (голосовое, видео‑кружок, опрос или что‑то ещё — сервер не сообщает, что именно) — откройте MAX, чтобы посмотреть"
+			id, _ := b.bot.SendToTopic(threadID, text, replyToTg)
+			return id
+		}
 		label := att.Name
 		if label == "" {
 			label = "вложение"
 		}
-		_ = b.bot.SendToTopic(threadID, fmt.Sprintf("%s 📎 Неподдерживаемое вложение (%s) — откройте MAX, чтобы посмотреть", caption, label))
+		id, _ := b.bot.SendToTopic(threadID, fmt.Sprintf("%s 📎 Неподдерживаемое вложение (%s) — откройте MAX, чтобы посмотреть", caption, label), replyToTg)
+		return id
 	}
+	return 0
+}
+
+// forwardSticker mirrors a MAX sticker. Animated ones come as gzipped Lottie
+// that already meets Telegram's .tgs rules (seen live: "tgs":1, 512x512,
+// 60fps), so they go out as real animated stickers; since stickers can't carry
+// a caption, a short "who sent it" line goes first and the sticker replies to
+// it. Static ones are a transparent PNG, which sendSticker refuses (WEBP only),
+// so they go out as a photo with the caption. Text is the last resort.
+func (b *Bridge) forwardSticker(threadID int, caption string, att maxapi.Attachment, replyToTg int64) int64 {
+	label := caption + " 🏷 Стикер " + att.Text
+	if att.LottieURL != "" {
+		data, _, tooLarge, err := httpDownloadCapped(att.LottieURL, 64*1024) // Telegram's .tgs size cap
+		if err == nil && !tooLarge && len(data) > 0 {
+			headID, herr := b.bot.SendToTopic(threadID, label, replyToTg)
+			if herr == nil {
+				if _, err := b.bot.SendSticker(threadID, data, "sticker.tgs", headID); err == nil {
+					return headID
+				} else {
+					log.Printf("[media] sendSticker (.tgs) failed: %v; falling back to the static image", err)
+					_ = b.bot.DeleteMessage(headID)
+				}
+			}
+		} else if tooLarge {
+			log.Printf("[media] animated sticker exceeds Telegram's 64 KB .tgs limit; using the static image")
+		} else if err != nil {
+			log.Printf("[media] animated sticker download failed: %v; using the static image", err)
+		}
+	}
+	if att.URL != "" {
+		if data, _, err := httpDownload(att.URL, 5*1024*1024); err == nil {
+			if id, err := b.bot.SendPhoto(threadID, data, label, replyToTg); err == nil {
+				return id
+			} else {
+				log.Printf("[media] sticker image send failed: %v", err)
+			}
+		} else {
+			log.Printf("[media] sticker image download failed: %v", err)
+		}
+	}
+	id, _ := b.bot.SendToTopic(threadID, label, replyToTg)
+	return id
+}
+
+// postVoicePlaceholder posts the "open MAX to listen" notice used whenever a
+// voice note can't be re-uploaded (no URL, too large, or a fetch/send failure).
+func (b *Bridge) postVoicePlaceholder(threadID int, caption string, duration int64, replyToTg int64) int64 {
+	id, _ := b.bot.SendToTopic(threadID, fmt.Sprintf("%s 🎤 Голосовое сообщение (%s) — откройте MAX, чтобы прослушать", caption, formatDuration(duration)), replyToTg)
+	return id
 }
 
 // formatDuration renders a millisecond duration as m:ss for voice notes.
@@ -192,14 +562,92 @@ func (b *Bridge) OnMaxReaction(r maxapi.IncomingReaction) {
 		return
 	}
 	if len(r.Counters) == 0 {
-		_ = b.bot.SendToTopic(threadID, "🔔 Реакции на сообщение сняты")
+		_, _ = b.bot.SendToTopic(threadID, "🔔 Реакции на сообщение сняты", 0)
 		return
 	}
 	parts := make([]string, 0, len(r.Counters))
 	for _, c := range r.Counters {
 		parts = append(parts, fmt.Sprintf("%s x%d", c.Reaction, c.Count))
 	}
-	_ = b.bot.SendToTopic(threadID, "🔔 Реакция: "+strings.Join(parts, ", "))
+	_, _ = b.bot.SendToTopic(threadID, "🔔 Реакция: "+strings.Join(parts, ", "), 0)
+}
+
+// OnMaxDelete mirrors a MAX message deletion by deleting the Telegram message
+// that mirrors it, if one is known (only messages this bridge itself
+// forwarded — in either direction — are tracked, so unrelated chat history
+// is never touched).
+func (b *Bridge) OnMaxDelete(d maxapi.IncomingDelete) {
+	if b.bot.GroupID() == 0 {
+		return
+	}
+	chatKey := strconv.FormatInt(d.ChatID, 10)
+	for _, id := range d.MessageIDs {
+		link, ok := b.st.TgByMax(chatKey, id)
+		if !ok {
+			continue
+		}
+		if err := b.bot.DeleteMessage(link.TgMsgID); err != nil {
+			log.Printf("[bridge] delete mirrored tg message %d (max msg %s) failed: %v", link.TgMsgID, id, err)
+		}
+	}
+}
+
+// handleReaction forwards a Telegram message_reaction update to MAX: setting
+// (or, if all reactions were removed, clearing) our reaction on the MAX
+// message the reacted-to Telegram message mirrors.
+func (b *Bridge) handleReaction(r *tg.MessageReactionUpdated) {
+	if b.bot.GroupID() == 0 || r.Chat.ID != b.bot.GroupID() || r.User == nil || r.User.IsBot {
+		return
+	}
+	link, ok := b.st.MaxByTg(r.MessageID)
+	if !ok {
+		return
+	}
+	chatID, err := strconv.ParseInt(link.MaxChatID, 10, 64)
+	if err != nil {
+		return
+	}
+	if len(r.NewReaction) == 0 {
+		if err := b.max.RemoveReaction(chatID, link.MaxMsgID); err != nil {
+			log.Printf("[bridge] MAX remove reaction failed: %v", err)
+		}
+		return
+	}
+	emoji := r.NewReaction[0].Emoji
+	if emoji == "" {
+		return // custom_emoji reaction — no MAX equivalent
+	}
+	if err := b.max.AddReaction(chatID, link.MaxMsgID, emoji); err != nil {
+		log.Printf("[bridge] MAX add reaction failed: %v", err)
+	}
+}
+
+// handleEdit forwards a Telegram edited_message update to MAX (MSG_EDIT), for
+// a message this bridge itself previously sent to MAX from that same
+// Telegram message. Edits made directly in MAX are not currently mirrored
+// back — no confirmed push opcode for that exists.
+func (b *Bridge) handleEdit(m *tg.Message) {
+	if b.bot.GroupID() == 0 || m.Chat.ID != b.bot.GroupID() || m.MessageThreadID == 0 {
+		return
+	}
+	link, ok := b.st.MaxByTg(m.MessageID)
+	if !ok {
+		return
+	}
+	chatID, err := strconv.ParseInt(link.MaxChatID, 10, 64)
+	if err != nil {
+		return
+	}
+	text := m.Text
+	if text == "" {
+		text = m.Caption
+	}
+	if text == "" {
+		return // e.g. a live-location update: nothing textual to edit in MAX
+	}
+	if err := b.max.EditMessage(chatID, link.MaxMsgID, text); err != nil {
+		log.Printf("[bridge] MAX edit message failed: %v", err)
+	}
 }
 
 func (b *Bridge) RunTelegram() {
@@ -226,6 +674,7 @@ func (b *Bridge) safeDispatch(u tg.Update) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[tg] recovered from panic handling update %d: %v", u.UpdateID, r)
+			b.ReportPanic("обновление Telegram", r)
 		}
 	}()
 	b.autoDetectGroup(u)
@@ -267,11 +716,28 @@ func (b *Bridge) isAdmin(userID int64) bool {
 }
 
 func (b *Bridge) handleUpdate(u tg.Update) {
+	if u.CallbackQuery != nil {
+		b.handleCallback(u.CallbackQuery)
+		return
+	}
+	if u.PollAnswer != nil {
+		b.handlePollAnswer(u.PollAnswer)
+		return
+	}
+	if u.MessageReaction != nil {
+		b.handleReaction(u.MessageReaction)
+		return
+	}
+	if u.EditedMessage != nil {
+		b.handleEdit(u.EditedMessage)
+		return
+	}
 	msg := u.Message
 	if msg == nil || msg.From.IsBot {
 		return
 	}
-	hasMedia := len(msg.Photo) > 0 || msg.Document != nil
+	hasMedia := len(msg.Photo) > 0 || msg.Document != nil || msg.Video != nil || msg.Voice != nil || msg.Audio != nil || msg.Sticker != nil ||
+		msg.Location != nil || msg.Contact != nil
 
 	// 1. Приватные сообщения боту (Личка) — только для Администраторов группы!
 	if msg.Chat.Type == "private" {
@@ -280,6 +746,9 @@ func (b *Bridge) handleUpdate(u tg.Update) {
 			return
 		}
 		if msg.Text != "" {
+			if b.takePrompt(msg.From.ID, msg.Text) { // an answer to a panel question
+				return
+			}
 			b.handleAdminPM(msg.Chat.ID, msg.Text)
 		}
 		return
@@ -289,10 +758,20 @@ func (b *Bridge) handleUpdate(u tg.Update) {
 	if b.bot.GroupID() == 0 || msg.Chat.ID != b.bot.GroupID() {
 		return
 	}
-	// General topic — только базовые команды.
+	// General topic — only for admins: bridge commands, the panel, and answers
+	// to panel questions. (Anyone in the group could run /restart or /settoken
+	// here before.)
 	if msg.MessageThreadID == 0 {
-		if strings.HasPrefix(msg.Text, "/") {
-			if reply := b.processCommand(msg.Text); reply != "" {
+		if msg.Text != "" && (strings.HasPrefix(msg.Text, "/") || b.hasPrompt(msg.From.ID)) {
+			if !b.isAdmin(msg.From.ID) {
+				return
+			}
+			if b.takePrompt(msg.From.ID, msg.Text) {
+				return
+			}
+			if cmd := commandName(msg.Text); cmd == "/panel" {
+				b.sendPanel(msg.Chat.ID)
+			} else if reply := b.processCommand(msg.Text); reply != "" {
 				b.notify(reply)
 			}
 		}
@@ -307,39 +786,169 @@ func (b *Bridge) handleUpdate(u tg.Update) {
 	if !ok {
 		return
 	}
+	// Admin commands acting on the chat behind this topic (/rename, /ban, …).
+	if b.handleTopicCommand(msg, chatKey) {
+		return
+	}
+	// A topic made for a contact we have no MAX dialog with yet: its first
+	// message opens the dialog.
+	if strings.HasPrefix(chatKey, store.PendingPrefix) {
+		b.openDialog(msg, chatKey)
+		return
+	}
 	chatID, err := strconv.ParseInt(chatKey, 10, 64)
 	if err != nil {
 		return
 	}
 
-	if hasMedia {
+	// "/del" (or "/delete") as a reply to a mirrored message deletes the
+	// corresponding MAX message — Telegram's Bot API has no "message was
+	// deleted" update, so this is the only way to drive MSG_DELETE from here.
+	cmdText := strings.ToLower(strings.TrimSpace(msg.Text))
+	if (cmdText == "/del" || cmdText == "/delete") && msg.ReplyToMessage != nil {
+		if link, ok := b.st.MaxByTg(msg.ReplyToMessage.MessageID); ok {
+			if err := b.max.DeleteMessage(chatID, link.MaxMsgID, false); err != nil {
+				log.Printf("[bridge] MAX delete message %s failed: %v", link.MaxMsgID, err)
+			}
+		}
+		return
+	}
+
+	// If this Telegram message replies to one we can map back to a MAX
+	// message (one MAX sent that we mirrored here, or one an admin sent from
+	// Telegram earlier), carry that over as a MAX REPLY link.
+	var replyToMax string
+	if msg.ReplyToMessage != nil {
+		if link, ok := b.st.MaxByTg(msg.ReplyToMessage.MessageID); ok {
+			replyToMax = link.MaxMsgID
+		}
+	}
+
+	// NOTE: video/voice are deliberately sent via the plain FILE_UPLOAD path
+	// (SendFileReply), NOT the native VIDEO_UPLOAD attach type. Live testing
+	// showed MAX reject a native voice (AUDIO) attach with "Invalid
+	// attachment" AND — reproduced twice — kill the whole websocket session
+	// (1006) right after, with the very next request often timing out
+	// post-reconnect too (looks like a brief server-side cooldown/anti-abuse
+	// reaction to the malformed frame). Given this repo's own risk-of-ban
+	// disclaimer, that's not a trade worth making for a cosmetic "shows as a
+	// real video/voice" gain, so both use FILE_UPLOAD, the long-proven-safe
+	// path (video shares VIDEO_UPLOAD's upload mechanics with voice, so it's
+	// kept on the safe path too even though only voice was confirmed bad).
+	// Photo is the exception — see its case below: PHOTO_UPLOAD is a
+	// completely different, simpler flow and was confirmed working live.
+	var maxMsgID string
+	switch {
+	case msg.Location != nil:
+		maxMsgID, err = b.max.SendLocation(chatID, msg.Location.Latitude, msg.Location.Longitude, replyToMax)
+		if err != nil {
+			log.Printf("[bridge] MAX SendLocation to chat %d failed: %v", chatID, err)
+		}
+	case msg.Contact != nil:
+		maxMsgID, err = b.max.SendContact(chatID, msg.Contact.FirstName, msg.Contact.LastName, msg.Contact.PhoneNumber, replyToMax)
+		if err != nil {
+			log.Printf("[bridge] MAX SendContact to chat %d failed: %v", chatID, err)
+		}
+	case msg.Voice != nil:
+		data, _, dlErr := b.bot.DownloadFile(msg.Voice.FileID)
+		if dlErr != nil {
+			b.reportSendFailure(msg.MessageThreadID, msg.MessageID, "скачать голосовое из Telegram", dlErr)
+			return
+		}
+		maxMsgID, err = b.max.SendFileReply(chatID, "voice.ogg", data, msg.Caption, replyToMax)
+		if err != nil {
+			log.Printf("[bridge] MAX SendFile (voice) to chat %d failed: %v", chatID, err)
+		}
+	case msg.Video != nil:
+		data, dlName, dlErr := b.bot.DownloadFile(msg.Video.FileID)
+		if dlErr != nil {
+			b.reportSendFailure(msg.MessageThreadID, msg.MessageID, "скачать видео из Telegram", dlErr)
+			return
+		}
+		name := msg.Video.FileName
+		if name == "" {
+			name = dlName
+		}
+		maxMsgID, err = b.max.SendFileReply(chatID, name, data, msg.Caption, replyToMax)
+		if err != nil {
+			log.Printf("[bridge] MAX SendFile (video) to chat %d failed: %v", chatID, err)
+		}
+	case len(msg.Photo) > 0:
+		// Unlike voice/video, PHOTO_UPLOAD is a simple synchronous flow (the
+		// token comes straight back in the HTTP upload response, no
+		// NOTIF_ATTACH wait) and has been confirmed live to work without
+		// issue, so photos DO use the native attach — falls back to a plain
+		// file only if MAX still rejects it for some reason.
+		data, _, dlErr := b.bot.DownloadFile(msg.Photo[len(msg.Photo)-1].FileID) // largest size
+		if dlErr != nil {
+			b.reportSendFailure(msg.MessageThreadID, msg.MessageID, "скачать фото из Telegram", dlErr)
+			return
+		}
+		maxMsgID, err = b.max.SendPhoto(chatID, data, msg.Caption, replyToMax)
+		if err != nil {
+			log.Printf("[bridge] MAX SendPhoto to chat %d failed: %v; sending as file instead", chatID, err)
+			maxMsgID, err = b.max.SendFileReply(chatID, "photo.jpg", data, msg.Caption, replyToMax)
+			if err != nil {
+				log.Printf("[bridge] MAX SendFile (photo fallback) to chat %d failed: %v", chatID, err)
+			}
+		}
+	case msg.Sticker != nil:
+		// MAX has no way to accept an arbitrary Telegram sticker as a native
+		// MAX sticker (that requires owning/registering a sticker pack via
+		// STICKER_SYNC/STICKER_DATA — out of scope), so it goes through as a
+		// plain file: .webp for static, .webm for video stickers, .tgs
+		// (gzipped Lottie JSON — not directly viewable, but at least not lost)
+		// for animated ones.
+		data, _, dlErr := b.bot.DownloadFile(msg.Sticker.FileID)
+		if dlErr != nil {
+			b.reportSendFailure(msg.MessageThreadID, msg.MessageID, "скачать стикер из Telegram", dlErr)
+			return
+		}
+		ext := "webp"
+		if msg.Sticker.IsVideo {
+			ext = "webm"
+		} else if msg.Sticker.IsAnimated {
+			ext = "tgs"
+		}
+		name := "sticker." + ext
+		if msg.Sticker.Emoji != "" {
+			name = msg.Sticker.Emoji + " " + name
+		}
+		maxMsgID, err = b.max.SendFileReply(chatID, name, data, msg.Caption, replyToMax)
+		if err != nil {
+			log.Printf("[bridge] MAX SendFile (sticker) to chat %d failed: %v", chatID, err)
+		}
+	case msg.Document != nil || msg.Audio != nil:
 		var fileID, name string
 		if msg.Document != nil {
 			fileID, name = msg.Document.FileID, msg.Document.FileName
 		} else {
-			fileID, name = msg.Photo[len(msg.Photo)-1].FileID, "photo.jpg" // largest size
+			fileID, name = msg.Audio.FileID, msg.Audio.FileName
 		}
-		data, dlName, err := b.bot.DownloadFile(fileID)
-		if err != nil {
-			log.Printf("[bridge] TG file download failed: %v", err)
+		data, dlName, dlErr := b.bot.DownloadFile(fileID)
+		if dlErr != nil {
+			b.reportSendFailure(msg.MessageThreadID, msg.MessageID, "скачать файл из Telegram (боты скачивают не более 20 МБ)", dlErr)
 			return
 		}
 		if name == "" {
 			name = dlName
 		}
-		if id, err := b.max.SendFile(chatID, name, data, msg.Caption); err != nil {
+		maxMsgID, err = b.max.SendFileReply(chatID, name, data, msg.Caption, replyToMax)
+		if err != nil {
 			log.Printf("[bridge] MAX SendFile to chat %d failed: %v", chatID, err)
-		} else if id != "" {
-			b.st.SeenAndMark("max:" + id)
 		}
-		return
+	default:
+		maxMsgID, err = b.max.SendMessageReply(chatID, msg.Text, replyToMax)
+		if err != nil {
+			log.Printf("[bridge] MAX send to chat %d failed: %v", chatID, err)
+		}
 	}
-
-	msgID, err := b.max.SendMessage(chatID, msg.Text)
-	if err != nil {
-		log.Printf("[bridge] MAX send to chat %d failed: %v", chatID, err)
-	} else if msgID != "" {
-		b.st.SeenAndMark("max:" + msgID) // skip our own echo
+	if err != nil && maxMsgID == "" {
+		b.reportSendFailure(msg.MessageThreadID, msg.MessageID, "отправить сообщение", err)
+	}
+	if maxMsgID != "" {
+		b.st.SeenAndMark("max:" + maxMsgID) // skip our own echo
+		b.st.LinkMessages(chatKey, maxMsgID, msg.MessageID, msg.MessageThreadID)
 	}
 }
 
@@ -348,7 +957,8 @@ func (b *Bridge) handleAdminPM(chatID int64, text string) {
 
 	menu := tg.ReplyKeyboardMarkup{
 		Keyboard: [][]tg.KeyboardButton{
-			{{Text: "📊 Статус"}, {Text: "🔄 Перезапустить"}},
+			{{Text: "🎛 Панель"}, {Text: "📊 Статус"}},
+			{{Text: "⏸ Пауза MAX"}, {Text: "▶️ Возобновить MAX"}, {Text: "🔄 Перезапустить"}},
 			{{Text: "📱 SMS Авторизация (рекомендуется)"}},
 			{{Text: "📄 Логи службы"}, {Text: "📋 Сырой лог (Debug)"}},
 			{{Text: "🩺 Диагностика MAX"}, {Text: "💬 Тестовое сообщение"}},
@@ -360,6 +970,12 @@ func (b *Bridge) handleAdminPM(chatID int64, text string) {
 
 	// Транслируем текстовые кнопки в команды
 	switch cmd {
+	case "🎛 Панель":
+		cmd = "/panel"
+	case "⏸ Пауза MAX":
+		cmd = "/pause"
+	case "▶️ Возобновить MAX":
+		cmd = "/resume"
 	case "📊 Статус":
 		cmd = "/status"
 	case "🔄 Перезапустить":
@@ -383,6 +999,10 @@ func (b *Bridge) handleAdminPM(chatID int64, text string) {
 		}
 	}
 
+	if commandName(cmd) == "/panel" {
+		b.sendPanel(chatID)
+		return
+	}
 	reply := b.processCommand(cmd)
 	if reply == "" {
 		reply = "Выберите действие в графическом меню управления мостом MAX-TG 👇"
@@ -407,20 +1027,25 @@ func (b *Bridge) processCommand(text string) string {
 	case "/start", "/help", "/menu":
 		return "Добро пожаловать в панель управления мостом MAX-TG!"
 	case "/status", "/ping":
-		connected, selfID, lastErr := b.max.Status()
+		return b.statusText()
 
-		s := "🔴 MAX: Отключен"
-		if connected {
-			s = fmt.Sprintf("🟢 MAX: Подключен (ID: %d)", selfID)
+	case "/pause":
+		// /pause [minutes] — disconnect from MAX for a while (default: until restart).
+		d := time.Duration(0)
+		if len(fields) > 1 {
+			if mins, err := strconv.Atoi(fields[1]); err == nil && mins > 0 {
+				d = time.Duration(mins) * time.Minute
+			}
 		}
+		b.pauseMax(d)
+		return ""
 
-		var sb strings.Builder
-		sb.WriteString(s + "\n")
-		if lastErr != "" {
-			sb.WriteString("⚠️ Последняя ошибка MAX: " + lastErr + "\n")
+	case "/resume":
+		if b.max.Resume() {
+			b.notify("▶️ MAX возобновлён — переподключаюсь.")
+			return ""
 		}
-		sb.WriteString(fmt.Sprintf("🔹 Группа TG ID: %d\n", b.bot.GroupID()))
-		return sb.String()
+		return "MAX не на паузе."
 
 	case "/log":
 		n := 20
@@ -528,7 +1153,12 @@ func (b *Bridge) processCommand(text string) string {
 		if len(logs) == 0 {
 			return "📋 Debug log пуст. Сервер пока не присылал событий (Push/Ping)."
 		}
-		return "--- Последние фреймы от MAX ---\n\n" + strings.Join(logs[len(logs)-10:], "\n\n")
+		n := 10
+		if len(logs) < n {
+			n = len(logs) // fewer than 10 frames so far (e.g. right after a fresh
+			// reconnect) — avoid a negative slice bound.
+		}
+		return "--- Последние фреймы от MAX ---\n\n" + strings.Join(logs[len(logs)-n:], "\n\n")
 
 	default:
 		return ""
