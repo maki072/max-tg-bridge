@@ -764,3 +764,9 @@ func (b *Bot) GetChatAdministrators(chatID int64) ([]int64, error) {
 	}
 	return ids, nil
 }
+
+// DeleteChatMessage deletes a message in any chat. In a private chat the bot
+// may delete the user's own messages (used to wipe SMS codes and passwords).
+func (b *Bot) DeleteChatMessage(chatID, tgMsgID int64) error {
+	return b.call("deleteMessage", map[string]any{"chat_id": chatID, "message_id": tgMsgID}, nil)
+}

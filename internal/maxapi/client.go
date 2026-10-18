@@ -1,6 +1,7 @@
 package maxapi
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -175,16 +176,22 @@ type Client struct {
 	userAgent string
 	cookie    string
 
-	conn     *websocket.Conn
-	writeMu  sync.Mutex
-	seq      int
-	seqMu    sync.Mutex
-	pending  map[int]chan *Frame
-	pendMu   sync.Mutex
-	selfID   int64
-	chatMu   sync.RWMutex
-	chatName map[int64]string
-	userName map[int64]string
+	conn    *websocket.Conn
+	writeMu sync.Mutex
+	seq     int
+	seqMu   sync.Mutex
+	pending map[int]chan *Frame
+	pendOp  map[int]int // seq -> opcode of in-flight requests (reply matching when the server doesn't echo seq)
+	pendMu  sync.Mutex
+
+	tcp              bool // desktop TCP transport (tcp.go) instead of a WebSocket
+	tcpConn          net.Conn
+	tcpR             *bufio.Reader
+	saveDesktopToken func(deviceID, token string)
+	selfID           int64
+	chatMu           sync.RWMutex
+	chatName         map[int64]string
+	userName         map[int64]string
 
 	allowSMS  bool
 	statMu    sync.RWMutex
@@ -223,11 +230,17 @@ type Options struct {
 	ForceOpcode int
 	// Binary switches the WebSocket to the binary msgpack transport web.max.ru
 	// itself uses (see binproto.go) — needed to receive polls in full.
-	Binary     bool
-	AllowSMS   bool
-	OnMessage  func(IncomingMessage)
-	OnReaction func(IncomingReaction)
-	OnDelete   func(IncomingDelete)
+	Binary bool
+	// TCP selects the desktop-client TCP transport (api2.oneme.ru, DESKTOP
+	// device type) — the browserless path; tokens minted by AuthSession work
+	// with it. Takes precedence over URL/Binary.
+	TCP bool
+	// SaveDesktopToken persists a session token rotated by LOGIN over TCP.
+	SaveDesktopToken func(deviceID, token string)
+	AllowSMS         bool
+	OnMessage        func(IncomingMessage)
+	OnReaction       func(IncomingReaction)
+	OnDelete         func(IncomingDelete)
 	// OnConnect, if set, is called (in its own goroutine) after every successful
 	// LOGIN — the initial connect AND every subsequent reconnect. Use it to
 	// re-sync chat history: a live WS session only ever delivers messages sent
@@ -257,32 +270,35 @@ func (c *Client) Binary() bool { return c.binary.Load() }
 
 func newClient(o Options) *Client {
 	return &Client{
-		url:         o.URL,
-		origin:      "https://web.max.ru",
-		phone:       o.Phone,
-		forceOp:     o.ForceOpcode,
-		deviceID:    o.DeviceID,
-		token:       o.Token,
-		userAgent:   o.UserAgent,
-		cookie:      o.Cookie,
-		allowSMS:    o.AllowSMS,
-		pending:     make(map[int]chan *Frame),
-		chatName:    make(map[int64]string),
-		userName:    make(map[int64]string),
-		deliver:     make(chan IncomingMessage, 256),
-		reactions:   make(chan IncomingReaction, 256),
-		deletes:     make(chan IncomingDelete, 256),
-		attachReady: make(chan struct{}, 1),
-		onMessage:   o.OnMessage,
-		onReaction:  o.OnReaction,
-		onDelete:    o.OnDelete,
-		onConnect:   o.OnConnect,
-		onStatus:    o.OnStatus,
-		saveToken:   o.SaveToken,
-		loadToken:   o.LoadToken,
-		readCode:    o.ReadSMSCode,
-		onCaptcha:   o.OnCaptcha,
-		refresh:     o.Refresh,
+		url:              o.URL,
+		origin:           "https://web.max.ru",
+		phone:            o.Phone,
+		forceOp:          o.ForceOpcode,
+		deviceID:         o.DeviceID,
+		token:            o.Token,
+		userAgent:        o.UserAgent,
+		cookie:           o.Cookie,
+		allowSMS:         o.AllowSMS,
+		pending:          make(map[int]chan *Frame),
+		pendOp:           make(map[int]int),
+		tcp:              o.TCP,
+		saveDesktopToken: o.SaveDesktopToken,
+		chatName:         make(map[int64]string),
+		userName:         make(map[int64]string),
+		deliver:          make(chan IncomingMessage, 256),
+		reactions:        make(chan IncomingReaction, 256),
+		deletes:          make(chan IncomingDelete, 256),
+		attachReady:      make(chan struct{}, 1),
+		onMessage:        o.OnMessage,
+		onReaction:       o.OnReaction,
+		onDelete:         o.OnDelete,
+		onConnect:        o.OnConnect,
+		onStatus:         o.OnStatus,
+		saveToken:        o.SaveToken,
+		loadToken:        o.LoadToken,
+		readCode:         o.ReadSMSCode,
+		onCaptcha:        o.OnCaptcha,
+		refresh:          o.Refresh,
 	}
 }
 
@@ -360,23 +376,17 @@ func (c *Client) session() (sessErr error) {
 	// Firefox User-Agent and NO cookies. Sending the browser's captured Edge UA or
 	// its web.max.ru cookies makes the WAF drop the socket (1006 EOF) — the probe
 	// in Diagnose (no cookie, default UA) connects and gets an INIT reply fine.
-	wsURL := c.url
-	if c.binary.Load() {
-		wsURL = BinaryWSURL // the binary transport lives on a different host
-	}
-	conn, _, err := maxDialer.Dial(wsURL, http_headers(c.origin, "", ""))
+	closeConn, err := c.dial()
 	if err != nil {
-		return fmt.Errorf("dial %s: %w", wsURL, err)
+		return err
 	}
-	defer conn.Close()
-	c.writeMu.Lock()
-	c.conn = conn
-	c.writeMu.Unlock()
+	defer closeConn()
 	if c.Paused() { // paused while we were dialing
 		return errPaused
 	}
 
 	c.pendMu.Lock()
+	c.pendOp = make(map[int]int)
 	c.pending = make(map[int]chan *Frame)
 	c.seq = 0
 	c.pendMu.Unlock()
@@ -435,6 +445,47 @@ func (c *Client) session() (sessErr error) {
 	err = <-readErr
 	close(done)
 	return err
+}
+
+// dial opens the transport for this session — the desktop TCP socket, or the
+// (JSON / binary) WebSocket — and returns the function that closes it.
+func (c *Client) dial() (func(), error) {
+	if c.tcp {
+		conn, err := dialMaxTCP(context.Background())
+		if err != nil {
+			return nil, fmt.Errorf("dial %s: %w", TCPAddr, err)
+		}
+		c.writeMu.Lock()
+		c.tcpConn = conn
+		c.tcpR = bufio.NewReaderSize(conn, 64<<10)
+		c.writeMu.Unlock()
+		return func() { _ = conn.Close() }, nil
+	}
+	wsURL := c.url
+	if c.binary.Load() {
+		wsURL = BinaryWSURL // the binary transport lives on a different host
+	}
+	conn, _, err := maxDialer.Dial(wsURL, http_headers(c.origin, "", ""))
+	if err != nil {
+		return nil, fmt.Errorf("dial %s: %w", wsURL, err)
+	}
+	c.writeMu.Lock()
+	c.conn = conn
+	c.writeMu.Unlock()
+	return func() { _ = conn.Close() }, nil
+}
+
+// closeConn drops the live socket (whichever transport) so the read loop fails
+// and the session unwinds.
+func (c *Client) closeConn() {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.conn != nil {
+		_ = c.conn.Close()
+	}
+	if c.tcpConn != nil {
+		_ = c.tcpConn.Close()
+	}
 }
 
 // noteBinaryFailure counts binary sessions that died before LOGIN completed;
@@ -564,6 +615,15 @@ func (c *Client) init() error {
 	// (defaultUserAgent) and stamp in the real captured browser UA if we have it.
 	// Keep the INIT userAgent consistent with the Firefox handshake (do not stamp
 	// in the captured Edge UA) — this matches the Diagnose probe that gets ACKed.
+	if c.tcp {
+		log.Printf("[max] INIT as DESKTOP over TCP (%s)", TCPAddr)
+		_, err := c.request(OpInit, map[string]any{
+			"userAgent":       tcpUserAgent(),
+			"deviceId":        c.deviceID,
+			"clientSessionId": time.Now().UnixNano() % 1000,
+		}, 15*time.Second)
+		return err
+	}
 	ua := defaultUserAgent()
 	log.Printf("[max] INIT appVersion=%q deviceType=%s binary=%t", ua.AppVersion, ua.DeviceType, c.binary.Load())
 	_, err := c.request(OpInit, map[string]any{
@@ -615,7 +675,7 @@ func (c *Client) smsLogin(captchaToken string) error {
 }
 
 func (c *Client) login() error {
-	resp, err := c.request(OpLogin, map[string]any{
+	req := map[string]any{
 		"interactive":  true,
 		"token":        c.token,
 		"chatsCount":   100,
@@ -623,9 +683,24 @@ func (c *Client) login() error {
 		"contactsSync": 0,
 		"presenceSync": 0,
 		"draftsSync":   0,
-	}, 30*time.Second)
+	}
+	if c.tcp {
+		// The desktop endpoint answers an internal error above 50 chats.
+		req = map[string]any{"token": c.token, "interactive": true, "chatsCount": 50}
+	}
+	resp, err := c.request(OpLogin, req, 30*time.Second)
 	if err != nil {
 		return err
+	}
+	if c.tcp {
+		// A successful LOGIN only sometimes rotates the session token; when it
+		// does, the new one must be kept or the next start is rejected.
+		if tok := findLongToken(resp.Payload); tok != "" && tok != c.token {
+			c.token = tok
+			if c.saveDesktopToken != nil {
+				c.saveDesktopToken(c.deviceID, tok)
+			}
+		}
 	}
 	type idStruct struct {
 		ID json.Number `json:"id"`
@@ -1352,13 +1427,18 @@ func (c *Client) request(opcode int, payload any, timeout time.Duration) (*Frame
 	ch := make(chan *Frame, 1)
 	c.pendMu.Lock()
 	c.pending[seq] = ch
+	c.pendOp[seq] = opcode
 	c.pendMu.Unlock()
+	forget := func() {
+		c.pendMu.Lock()
+		delete(c.pending, seq)
+		delete(c.pendOp, seq)
+		c.pendMu.Unlock()
+	}
 	raw, _ := json.Marshal(payload)
 	f := Frame{Ver: ProtocolVersion, Cmd: CmdRequest, Seq: seq, Opcode: opcode, Payload: raw}
 	if err := c.writeFrame(f); err != nil {
-		c.pendMu.Lock()
-		delete(c.pending, seq)
-		c.pendMu.Unlock()
+		forget()
 		return nil, err
 	}
 	select {
@@ -1368,14 +1448,26 @@ func (c *Client) request(opcode int, payload any, timeout time.Duration) (*Frame
 		}
 		return res, nil
 	case <-time.After(timeout):
-		c.pendMu.Lock()
-		delete(c.pending, seq)
-		c.pendMu.Unlock()
+		forget()
 		return nil, fmt.Errorf("timeout waiting for reply to opcode %d (seq %d)", opcode, seq)
 	}
 }
 
 func (c *Client) writeFrame(f Frame) error {
+	if c.tcp {
+		raw, err := encodeBinFrameVer(f, tcpProtocolVersion)
+		if err != nil {
+			return err
+		}
+		c.writeMu.Lock()
+		defer c.writeMu.Unlock()
+		if c.tcpConn == nil {
+			return fmt.Errorf("not connected")
+		}
+		_ = c.tcpConn.SetWriteDeadline(time.Now().Add(20 * time.Second))
+		_, err = c.tcpConn.Write(raw)
+		return err
+	}
 	msgType := websocket.TextMessage
 	raw, err := json.Marshal(f)
 	if c.binary.Load() {
@@ -1393,27 +1485,75 @@ func (c *Client) writeFrame(f Frame) error {
 	return c.conn.WriteMessage(msgType, raw)
 }
 
+// takePending finds the request a reply answers: by echoed seq, or — MAX does
+// not always echo it — the oldest in-flight request with the same opcode.
+func (c *Client) takePending(f Frame) chan *Frame {
+	c.pendMu.Lock()
+	defer c.pendMu.Unlock()
+	seq := f.Seq
+	ch := c.pending[seq]
+	if ch == nil {
+		best := -1
+		for s, op := range c.pendOp {
+			if op == f.Opcode && (best < 0 || s < best) {
+				best = s
+			}
+		}
+		if best < 0 {
+			return nil
+		}
+		seq, ch = best, c.pending[best]
+	}
+	delete(c.pending, seq)
+	delete(c.pendOp, seq)
+	return ch
+}
+
+// nextFrame reads and decodes the next frame off whichever transport is live.
+// A decode problem is returned as skip=true (the connection is fine); an error
+// with skip=false ends the session.
+func (c *Client) nextFrame() (f Frame, skip bool, err error) {
+	if c.tcp {
+		_ = c.tcpConn.SetReadDeadline(time.Now().Add(tcpReadIdle))
+		data, err := readTCPRaw(c.tcpR)
+		if err != nil {
+			return Frame{}, false, err
+		}
+		f, err = decodeBinFrame(data)
+		if err != nil {
+			log.Printf("[max] bad tcp frame: %v", err)
+			return Frame{}, true, nil
+		}
+		return f, false, nil
+	}
+	msgType, data, err := c.conn.ReadMessage()
+	if err != nil {
+		return Frame{}, false, err
+	}
+	if msgType == websocket.BinaryMessage {
+		if f, err = decodeBinFrame(data); err != nil {
+			log.Printf("[max] bad binary frame: %v", err)
+			return Frame{}, true, nil
+		}
+		return f, false, nil
+	}
+	if err := json.Unmarshal(data, &f); err != nil {
+		return Frame{}, true, nil
+	}
+	return f, false, nil
+}
+
 func (c *Client) readLoop() error {
 	for {
-		msgType, data, err := c.conn.ReadMessage()
+		f, skip, err := c.nextFrame()
 		if err != nil {
 			return err
 		}
-		var f Frame
-		if msgType == websocket.BinaryMessage {
-			if f, err = decodeBinFrame(data); err != nil {
-				log.Printf("[max] bad binary frame: %v", err)
-				continue
-			}
-		} else if err := json.Unmarshal(data, &f); err != nil {
+		if skip {
 			continue
 		}
 		if f.Cmd == CmdAck || f.Cmd == CmdError {
-			c.pendMu.Lock()
-			ch := c.pending[f.Seq]
-			delete(c.pending, f.Seq)
-			c.pendMu.Unlock()
-			if ch != nil {
+			if ch := c.takePending(f); ch != nil {
 				ch <- &f
 			}
 			continue
@@ -1435,7 +1575,7 @@ func (c *Client) handlePush(f Frame) {
 	c.debugMu.Unlock()
 
 	if f.Opcode == OpPing {
-		_ = c.writeFrame(Frame{Ver: ProtocolVersion, Cmd: CmdRequest, Seq: 0, Opcode: OpPing, Payload: json.RawMessage(`{"interactive":true}`)})
+		_ = c.writeFrame(c.pingFrame())
 		return
 	}
 	if f.Opcode == OpPushAttach { // NOTIF_ATTACH: an upload finished
@@ -1676,7 +1816,7 @@ func (c *Client) heartbeat(done chan struct{}) {
 		case <-done:
 			return
 		case <-ticker.C:
-			_ = c.writeFrame(Frame{Ver: ProtocolVersion, Cmd: CmdRequest, Seq: 0, Opcode: OpPing, Payload: json.RawMessage(`{"interactive":true}`)})
+			_ = c.writeFrame(c.pingFrame())
 		}
 	}
 }
@@ -1687,4 +1827,14 @@ func (c *Client) DumpDebugLog() []string {
 	logCopy := make([]string, len(c.debugLog))
 	copy(logCopy, c.debugLog)
 	return logCopy
+}
+
+// pingFrame is a keep-alive PING: the web transports send {"interactive":true},
+// the desktop TCP client a bare, payload-less frame.
+func (c *Client) pingFrame() Frame {
+	f := Frame{Ver: ProtocolVersion, Cmd: CmdRequest, Seq: 0, Opcode: OpPing}
+	if !c.tcp {
+		f.Payload = json.RawMessage(`{"interactive":true}`)
+	}
+	return f
 }

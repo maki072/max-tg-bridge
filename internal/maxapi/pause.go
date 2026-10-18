@@ -34,11 +34,7 @@ func (c *Client) Pause(d time.Duration) {
 	}
 	c.pause.mu.Unlock()
 
-	c.writeMu.Lock()
-	if c.conn != nil {
-		_ = c.conn.Close() // the read loop fails and the session unwinds
-	}
-	c.writeMu.Unlock()
+	c.closeConn() // the read loop fails and the session unwinds
 }
 
 // Resume ends a pause; Run reconnects right away. Reports whether it was paused.

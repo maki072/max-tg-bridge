@@ -133,3 +133,18 @@ func TestAlertCooldown(t *testing.T) {
 		t.Fatal("a zero cooldown never blocks")
 	}
 }
+
+func TestMaskPhoneAndProxy(t *testing.T) {
+	if got := maskPhone("+79991234567"); got != "+7999•••67" {
+		t.Errorf("maskPhone = %q", got)
+	}
+	if got := maskPhone("123"); got != "123" {
+		t.Errorf("short numbers pass through, got %q", got)
+	}
+	if got := maskProxy("socks5://user:secret@h:1080"); strings.Contains(got, "secret") || strings.Contains(got, "user") {
+		t.Errorf("credentials leaked: %q", got)
+	}
+	if maskProxy("") == "" || maskProxy("socks5://h:1080") != "socks5://h:1080" {
+		t.Error("empty and credential-less proxies render plainly")
+	}
+}

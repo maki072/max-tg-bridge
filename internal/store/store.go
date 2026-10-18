@@ -17,7 +17,8 @@ type Store struct {
 	DeviceID  string          `json:"device_id"`
 	Token     string          `json:"token"`
 	UserAgent string          `json:"user_agent"`
-	Cookie    string          `json:"cookie"` // MAX web cookies captured from the browser
+	Cookie    string          `json:"cookie"`     // MAX web cookies captured from the browser
+	TokenKind string          `json:"token_kind"` // "desktop" (browserless sign-in) or "web"; empty = legacy web
 	TgOffset  int64           `json:"tg_offset"`
 	ChatTopic map[string]int  `json:"chat_topic"` // maxChatID -> tg thread id
 	Seen      []string        `json:"seen"`       // recent message ids (dedupe)
@@ -193,6 +194,7 @@ func (s *Store) SetCredentials(deviceID, token, userAgent, cookie string) {
 	s.Token = token
 	s.UserAgent = userAgent
 	s.Cookie = cookie
+	s.TokenKind = TokenWeb
 	_ = s.save()
 }
 
@@ -422,4 +424,47 @@ func (s *Store) SeenAndMark(id string) bool {
 	}
 	_ = s.save()
 	return false
+}
+
+// Token kinds: which kind of MAX client a stored session token was minted for.
+// A token from SMS sign-in via the bridge is a "desktop" one and is used over
+// the TCP transport; one imported from a browser (or an older state file, where
+// the kind is empty) belongs to a web session and keeps the WebSocket transport.
+const (
+	TokenWeb     = "web"
+	TokenDesktop = "desktop"
+)
+
+// SetDesktopCredentials stores a session token minted by the browserless
+// (desktop/TCP) sign-in. No web user agent or cookies apply to it.
+func (s *Store) SetDesktopCredentials(deviceID, token string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.DeviceID = deviceID
+	s.Token = token
+	s.UserAgent = ""
+	s.Cookie = ""
+	s.TokenKind = TokenDesktop
+	_ = s.save()
+}
+
+// ClearCredentials forgets the MAX session (logout); the device id is kept.
+func (s *Store) ClearCredentials() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Token = ""
+	s.UserAgent = ""
+	s.Cookie = ""
+	s.TokenKind = ""
+	_ = s.save()
+}
+
+// TokenKindOf returns TokenDesktop, TokenWeb, or "" (no token / legacy state).
+func (s *Store) TokenKindOf() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Token == "" {
+		return ""
+	}
+	return s.TokenKind
 }

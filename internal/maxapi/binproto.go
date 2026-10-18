@@ -42,24 +42,31 @@ const maxBinPayload = 64 << 20
 
 // encodeBinFrame renders f (JSON payload) as a binary ver=10 frame with an
 // uncompressed msgpack payload.
-func encodeBinFrame(f Frame) ([]byte, error) {
-	var v any
+func encodeBinFrame(f Frame) ([]byte, error) { return encodeBinFrameVer(f, binProtocolVersion) }
+
+// encodeBinFrameVer is encodeBinFrame with an explicit header version byte
+// (10 on the web WebSocket, 11 on the desktop TCP transport). A frame with no
+// payload at all (a bare PING) carries an empty body, as the desktop client
+// sends it.
+func encodeBinFrameVer(f Frame, ver byte) ([]byte, error) {
+	var body []byte
 	if len(f.Payload) > 0 {
+		var v any
 		dec := json.NewDecoder(strings.NewReader(string(f.Payload)))
 		dec.UseNumber()
 		if err := dec.Decode(&v); err != nil {
 			return nil, fmt.Errorf("binary frame: payload is not JSON: %w", err)
 		}
-	}
-	body, err := msgpackEncode(nil, v)
-	if err != nil {
-		return nil, err
+		var err error
+		if body, err = msgpackEncode(nil, v); err != nil {
+			return nil, err
+		}
 	}
 	if len(body) > 0xFFFFFF {
 		return nil, fmt.Errorf("binary frame: payload too large (%d bytes)", len(body))
 	}
 	out := make([]byte, binHeaderLen, binHeaderLen+len(body))
-	out[0] = binProtocolVersion
+	out[0] = ver
 	out[1] = byte(f.Cmd)
 	binary.BigEndian.PutUint16(out[2:], uint16(f.Seq))
 	binary.BigEndian.PutUint16(out[4:], uint16(f.Opcode))
@@ -85,7 +92,14 @@ func decodeBinFrame(data []byte) (Frame, error) {
 		return f, fmt.Errorf("binary frame: payload length %d exceeds frame (%d)", n, len(body))
 	}
 	body = body[:n]
-	if flags != 0 {
+	switch {
+	case flags == 0:
+	case flags == 0xFF: // Zstandard (desktop transport)
+		var err error
+		if body, err = zstdDecompress(body, maxBinPayload); err != nil {
+			return f, fmt.Errorf("binary frame (opcode %d): zstd: %w", f.Opcode, err)
+		}
+	default: // LZ4 block
 		var err error
 		if body, err = lz4BlockDecompress(body, maxBinPayload); err != nil {
 			return f, fmt.Errorf("binary frame (opcode %d): %w", f.Opcode, err)
@@ -99,8 +113,19 @@ func decodeBinFrame(data []byte) (Frame, error) {
 	if err != nil {
 		return f, fmt.Errorf("binary frame (opcode %d): %w", f.Opcode, err)
 	}
-	if len(rest) != 0 {
-		return f, fmt.Errorf("binary frame (opcode %d): %d trailing bytes", f.Opcode, len(rest))
+	// Some responses concatenate several top-level msgpack values; the answer is
+	// the first object among them (falling back to the first value).
+	if _, isMap := v.(map[string]any); !isMap {
+		for len(rest) > 0 {
+			var next any
+			if next, rest, err = msgpackDecode(rest); err != nil {
+				break
+			}
+			if _, ok := next.(map[string]any); ok {
+				v = next
+				break
+			}
+		}
 	}
 	raw, err := json.Marshal(v)
 	if err != nil {

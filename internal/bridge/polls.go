@@ -190,6 +190,9 @@ func (b *Bridge) handleCallback(cq *tg.CallbackQuery) {
 	case strings.HasPrefix(cq.Data, cbPanel):
 		b.handlePanelCallback(cq)
 		return
+	case strings.HasPrefix(cq.Data, cbLogin):
+		b.handleLoginCallback(cq)
+		return
 	case strings.HasPrefix(cq.Data, cbKeyboard), cq.Data == cbKbGeo, cq.Data == cbKbContact, cq.Data == cbKbNA:
 		b.handleKeyboardCallback(cq)
 		return

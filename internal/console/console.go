@@ -31,12 +31,9 @@ func Run(configPath string) {
 			fmt.Printf("Setup error: %v\n", err)
 			return
 		}
-		// Get a MAX token: prefer browser CDP (zero-touch) if configured.
-		if cfg, _ := config.LoadRaw(configPath); cfg != nil && cfg.BrowserCDPURL != "" {
-			if strings.EqualFold(ask(in, "Pull MAX token from browser now? (y/n)", "y"), "y") {
-				pullFromBrowser(configPath)
-			}
-		} else if strings.EqualFold(ask(in, "Authorize MAX via SMS now? (y/n)", "y"), "y") {
+		// Sign in to MAX with an SMS code — no browser needed. (It can also be
+		// done later from the Telegram bot with /login.)
+		if strings.EqualFold(ask(in, "Sign in to MAX now (SMS, no browser)? (y/n — or do it later with /login in the bot)", "y"), "y") {
 			smsAuth(configPath, in)
 		}
 		// Offer to register autostart at logon (user session, no admin).
@@ -57,12 +54,12 @@ func Run(configPath string) {
 	for {
 		fmt.Println()
 		fmt.Println("=== MAX <-> Telegram bridge ===")
-		fmt.Println("  1) SMS authorization (mint MAX token)")
-		fmt.Println("  2) Pull MAX token from browser now (CDP)")
-		fmt.Println("  3) Paste a ready MAX token (manual import)")
+		fmt.Println("  1) Sign in to MAX by SMS (no browser; also: /login in the bot)")
+		fmt.Println("  2) [optional] Pull MAX token from a logged-in browser (CDP)")
+		fmt.Println("  3) [optional] Paste a ready web MAX token (manual import)")
 		fmt.Println("  4) Check Telegram connectivity (getMe, incl. proxy)")
 		fmt.Println("  5) Detect Telegram group id")
-		fmt.Println("  6) Edit settings (re-run wizard)")
+		fmt.Println("  6) Edit bot token / proxy / group (everything else: /settings in the bot)")
 		fmt.Println("  7) Show status")
 		fmt.Println("  8) START the bridge now (background) — needed for the bot to reply")
 		fmt.Println("  9) Install / update autostart (runs at logon)")
@@ -179,10 +176,8 @@ func pullFromBrowser(configPath string) {
 func setupWizard(configPath string, in *bufio.Reader) (*config.Config, error) {
 	cfg, _ := config.LoadRaw(configPath)
 
-	cfg.Phone = ask(in, "MAX phone (+7XXXXXXXXXX)", cfg.Phone)
 	cfg.TelegramBotToken = ask(in, "Telegram bot token (from @BotFather)", cfg.TelegramBotToken)
 	cfg.TelegramProxy = ask(in, "Telegram SOCKS5 proxy (empty = direct; socks5://host:1080)", cfg.TelegramProxy)
-	cfg.BrowserCDPURL = ask(in, "Browser CDP url for auto token refresh (empty = off; http://127.0.0.1:9222)", cfg.BrowserCDPURL)
 
 	// Group id: leave empty to auto-detect at runtime, or set explicitly.
 	fmt.Println("Group id: leave empty to auto-detect (send a message in the group later),")
@@ -217,7 +212,9 @@ func setupWizard(configPath string, in *bufio.Reader) (*config.Config, error) {
 	return cfg, nil
 }
 
-// smsAuth performs a one-shot SMS login (with optional captcha) and stores the token.
+// smsAuth signs in to MAX without a browser: SMS code (and the 2FA password if
+// the account has one) over the desktop TCP transport, then stores the session.
+// The same flow is available from the Telegram bot as /login.
 func smsAuth(configPath string, in *bufio.Reader) {
 	cfg, err := config.LoadPartial(configPath)
 	if err != nil {
@@ -229,35 +226,54 @@ func smsAuth(configPath string, in *bufio.Reader) {
 		fmt.Printf("State error: %v\n", err)
 		return
 	}
-	deviceID, _, _, _ := st.GetCredentials()
-
-	client := maxapi.New(maxapi.Options{
-		URL:       cfg.MaxWSURL,
-		Phone:     cfg.Phone,
-		DeviceID:  deviceID,
-		AllowSMS:  true,
-		SaveToken: func(d, t, ua, ck string) { st.SetCredentials(d, t, ua, ck) },
-		LoadToken: func() (string, string, string) { d, t, _, ck := st.GetCredentials(); return d, t, ck },
-		ReadSMSCode: func() string {
-			return ask(in, "Enter MAX SMS code", "")
-		},
-		OnCaptcha: func(link string) string {
-			fmt.Println("\nMAX requires a captcha. Opening it in your browser...")
-			openInBrowser(link)
-			fmt.Println("Link:", link)
-			fmt.Println("Solve it in the browser. If you can extract the captchaToken")
-			fmt.Println("(VK ID flow), paste it below; otherwise leave empty and use")
-			fmt.Println("option 3 (paste a ready MAX token) instead.")
-			return ask(in, "captchaToken (or empty to abort)", "")
-		},
-	})
-
-	fmt.Printf("Requesting SMS for %s ...\n", cfg.Phone)
-	if err := client.AuthOnce(); err != nil {
-		fmt.Printf("Auth failed: %v\n", err)
+	phone := ask(in, "MAX phone (+7XXXXXXXXXX)", cfg.Phone)
+	if phone == "" {
+		fmt.Println("Phone is required.")
 		return
 	}
-	fmt.Println("Auth OK. Token saved. The service picks it up on its next reconnect.")
+	if !strings.HasPrefix(phone, "+") {
+		phone = "+" + phone
+	}
+	fmt.Println("Connecting to MAX (desktop client, no browser) ...")
+	sess, err := maxapi.NewAuthSession(st.EnsureDeviceID())
+	if err != nil {
+		fmt.Printf("Connect failed: %v\n", maxapi.DescribeError(err))
+		return
+	}
+	defer sess.Close()
+	fmt.Printf("Requesting SMS for %s ...\n", phone)
+	if err := sess.RequestSMS(phone); err != nil {
+		fmt.Printf("Failed: %v\n", err)
+		return
+	}
+	res, needPassword, hint, err := sess.VerifyCode(ask(in, "Enter MAX SMS code", ""))
+	if err != nil {
+		fmt.Printf("Failed: %v\n", err)
+		return
+	}
+	if needPassword {
+		fmt.Println("This account has a password (2FA).")
+		if hint != "" {
+			fmt.Println("Hint:", hint)
+		}
+		for {
+			res, err = sess.CheckPassword(ask(in, "2FA password", ""))
+			if err == nil {
+				break
+			}
+			fmt.Printf("Wrong password or error: %v\n", err)
+			if !strings.EqualFold(ask(in, "Try again? (y/n)", "y"), "y") {
+				return
+			}
+		}
+	}
+	st.SetDesktopCredentials(st.EnsureDeviceID(), res.Token)
+	cfg.Phone = phone
+	if err := config.Save(configPath, cfg); err != nil {
+		fmt.Printf("(could not save the phone to the config: %v)\n", err)
+	}
+	fmt.Println("Auth OK. Token saved. If the bridge is already running, send /restart to the bot")
+	fmt.Println("(or close and start it again) so it reconnects with the new session.")
 }
 
 // manualToken imports a token+deviceId obtained from a logged-in browser.

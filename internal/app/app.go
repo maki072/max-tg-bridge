@@ -55,8 +55,13 @@ func (p *Program) run() {
 	deviceID := st.EnsureDeviceID()
 	_, token, userAgent, cookie := st.GetCredentials()
 
+	// Transport: the browserless desktop/TCP one when there is no token yet or
+	// the token came from the bridge's own sign-in; the web WebSocket for a
+	// token imported from a browser (see config.UseTCP).
+	useTCP := p.cfg.UseTCP(token != "", st.TokenKindOf())
+
 	var refresh func() (string, string, string, string, error)
-	if p.cfg.BrowserCDPURL != "" {
+	if p.cfg.BrowserCDPURL != "" && !useTCP { // a browser token is a web token: no use over TCP
 		cdp := p.cfg.BrowserCDPURL
 		match := p.cfg.BrowserMatchURL
 		refresh = func() (string, string, string, string, error) {
@@ -64,18 +69,25 @@ func (p *Program) run() {
 		}
 		log.Printf("[app] auto token refresh via browser CDP at %s", cdp)
 	}
+	if useTCP {
+		log.Printf("[app] MAX transport: desktop TCP (browserless)")
+	} else {
+		log.Printf("[app] MAX transport: web WebSocket (token from a browser)")
+	}
 
 	maxapi.AppVersionOverride = p.cfg.MaxAppVersion
 	maxClient := maxapi.New(maxapi.Options{
-		URL:         p.cfg.MaxWSURL,
-		Phone:       p.cfg.Phone,
-		DeviceID:    deviceID,
-		Token:       token,
-		UserAgent:   userAgent,
-		Cookie:      cookie,
-		ForceOpcode: p.cfg.IncomingOpcode,
-		Binary:      p.cfg.MaxBinary == nil || *p.cfg.MaxBinary, // binary unless explicitly disabled
-		AllowSMS:    false,
+		URL:              p.cfg.MaxWSURL,
+		Phone:            p.cfg.Phone,
+		DeviceID:         deviceID,
+		Token:            token,
+		UserAgent:        userAgent,
+		Cookie:           cookie,
+		ForceOpcode:      p.cfg.IncomingOpcode,
+		Binary:           p.cfg.MaxBinary == nil || *p.cfg.MaxBinary, // binary unless explicitly disabled
+		TCP:              useTCP,
+		SaveDesktopToken: func(d, t string) { st.SetDesktopCredentials(d, t) },
+		AllowSMS:         false,
 		OnMessage: func(m maxapi.IncomingMessage) {
 			defer func() {
 				if r := recover(); r != nil {

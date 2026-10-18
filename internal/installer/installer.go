@@ -182,3 +182,14 @@ func copyFile(src, dst string) error {
 	_, err = io.Copy(out, in)
 	return err
 }
+
+// AutostartRegistered reports whether the logon-autostart shortcut exists.
+func AutostartRegistered() bool {
+	startup := os.Getenv("APPDATA")
+	if startup == "" {
+		return false
+	}
+	lnk := filepath.Join(startup, `Microsoft\Windows\Start Menu\Programs\Startup`, appName+".lnk")
+	_, err := os.Stat(lnk)
+	return err == nil
+}

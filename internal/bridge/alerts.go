@@ -136,8 +136,10 @@ func (b *Bridge) checkDown() {
 	if lastErr != "" {
 		text += "\nПоследняя ошибка: " + truncateRunes(lastErr, 300)
 	}
-	if strings.Contains(lastErr, "login") || strings.Contains(lastErr, "token") {
-		text += "\nПохоже, MAX не принял токен — авторизуйтесь заново: /auth в личке бота."
+	if _, tok, _, _ := b.st.GetCredentials(); tok == "" {
+		text = "🔴 MAX не авторизован — мост ничего не пересылает. Войдите: /login в личке бота (панель → «Вход в MAX»)."
+	} else if strings.Contains(lastErr, "login") || strings.Contains(lastErr, "token") {
+		text += "\nПохоже, MAX не принял токен — войдите заново: /login в личке бота."
 	}
 	if b.alert("max-down", text, 30*time.Minute) {
 		b.al.mu.Lock()

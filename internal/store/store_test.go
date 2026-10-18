@@ -80,3 +80,28 @@ func TestMoveTopic(t *testing.T) {
 		t.Errorf("ChatByTopic = %q,%v", key, ok)
 	}
 }
+
+func TestTokenKinds(t *testing.T) {
+	s := newTestStore(t)
+	if s.TokenKindOf() != "" {
+		t.Error("no token, no kind")
+	}
+	s.SetCredentials("dev", "webtok", "ua", "ck")
+	if s.TokenKindOf() != TokenWeb {
+		t.Errorf("browser-style credentials are web, got %q", s.TokenKindOf())
+	}
+	s.SetDesktopCredentials("dev", "desktoptok")
+	if s.TokenKindOf() != TokenDesktop {
+		t.Errorf("got %q", s.TokenKindOf())
+	}
+	if _, tok, ua, ck := s.GetCredentials(); tok != "desktoptok" || ua != "" || ck != "" {
+		t.Errorf("desktop credentials must not carry a web UA/cookie: %q %q %q", tok, ua, ck)
+	}
+	s.ClearCredentials()
+	if _, tok, _, _ := s.GetCredentials(); tok != "" || s.TokenKindOf() != "" {
+		t.Error("logout must clear the token")
+	}
+	if s.EnsureDeviceID() == "" {
+		t.Error("the device id survives logout")
+	}
+}

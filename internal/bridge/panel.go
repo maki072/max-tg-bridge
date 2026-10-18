@@ -84,7 +84,7 @@ func (b *Bridge) takePrompt(userID int64, text string) bool {
 	}
 	text = strings.TrimSpace(text)
 	if commandName(text) == "/cancel" {
-		b.showPanelView(p, b.rootView())
+		b.showPanelView(p, b.rootView(p.chatID))
 		return true
 	}
 	go b.answerPrompt(p, text)
@@ -165,6 +165,8 @@ func (b *Bridge) answerPrompt(p prompt, text string) {
 		b.showPanelView(p, searchResults(text, contacts, channels))
 	case "new_group":
 		b.createGroupFromPrompt(p, text)
+	case "set_proxy":
+		b.applyProxy(p, text)
 	}
 }
 
@@ -244,6 +246,9 @@ func (b *Bridge) statusLine() string {
 	if l := b.pauseLabel(); l != "" {
 		return "⏸ MAX на паузе (" + l + ")"
 	}
+	if _, token, _, _ := b.st.GetCredentials(); token == "" {
+		return "🔴 MAX не авторизован — войдите: /login в личке бота"
+	}
 	connected, selfID, lastErr := b.max.Status()
 	if connected {
 		return fmt.Sprintf("🟢 MAX подключён (ID %d)", selfID)
@@ -255,7 +260,7 @@ func (b *Bridge) statusLine() string {
 	return s
 }
 
-func (b *Bridge) rootView() view {
+func (b *Bridge) rootView(chatID int64) view {
 	chats := 0
 	for k := range b.st.AllTopics() {
 		if !strings.HasPrefix(k, store.PendingPrefix) {
@@ -263,9 +268,16 @@ func (b *Bridge) rootView() view {
 		}
 	}
 	text := fmt.Sprintf("🎛 Панель управления MAX ↔ Telegram\n%s\nЧатов в Telegram: %d · заглушено: %d", b.statusLine(), chats, len(b.st.Bans()))
+	// In the group the sign-in is a deep link into a private chat with the bot
+	// (codes and passwords must never be typed into the group).
+	loginBtn := btn("🔐 Вход в MAX", cbPanel+"login")
+	if link := b.loginLink(); link != "" && chatID == b.bot.GroupID() {
+		loginBtn = tg.InlineKeyboardButton{Text: "🔐 Вход в MAX", URL: link}
+	}
 	return view{text, kbd(
 		row(btn("👤 Найти контакт", cbPanel+"contacts"), btn("👥 Группы", cbPanel+"groups")),
 		row(btn("🔕 Заглушенные чаты", cbPanel+"muted"), btn("⚙️ Система", cbPanel+"sys")),
+		row(loginBtn, btn("🛠 Настройки", cbPanel+"set")),
 	)}
 }
 
@@ -322,7 +334,7 @@ func (b *Bridge) systemView() view {
 		pauseBtn = btn("▶️ Возобновить MAX", cbPanel+"resume")
 	}
 	return view{"⚙️ Система\n" + b.statusLine(), kbd(
-		row(btn("📊 Статус", cbPanel+"status")),
+		row(btn("📊 Статус", cbPanel+"status"), btn("📄 Лог", cbPanel+"log")),
 		row(pauseBtn, btn("🔄 Пересинхронизация", cbPanel+"resync")),
 		backBtn("root"),
 	)}
@@ -356,7 +368,7 @@ func (b *Bridge) statusText() string {
 // sendPanel posts the panel card into chatID (a private chat or the group's
 // General topic). In the group it is also pinned.
 func (b *Bridge) sendPanel(chatID int64) {
-	v := b.rootView()
+	v := b.rootView(chatID)
 	id, err := b.bot.SendChat(chatID, 0, v.text, v.markup)
 	if err != nil {
 		log.Printf("[panel] send failed: %v", err)
@@ -401,7 +413,7 @@ func (b *Bridge) handlePanelCallback(cq *tg.CallbackQuery) {
 
 	switch action {
 	case "root":
-		show(b.rootView())
+		show(b.rootView(chatID))
 		answer("", false)
 	case "contacts":
 		show(contactsView())
@@ -494,8 +506,13 @@ func (b *Bridge) handlePanelCallback(cq *tg.CallbackQuery) {
 	case "no":
 		_ = b.bot.EditChatMessage(chatID, msgID, "Отменено.", nil)
 		answer("", false)
-	default:
+	case "log":
+		show(view{b.tailLog(25), kbd(row(btn("🔄 Обновить", cbPanel+"log")), backBtn("sys"))})
 		answer("", false)
+	default:
+		if !b.settingsAction(action, rest, cq, show, answer) {
+			answer("", false)
+		}
 	}
 }
 

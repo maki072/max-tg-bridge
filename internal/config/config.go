@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"maxtg/internal/paths"
 )
@@ -63,6 +64,13 @@ type Config struct {
 	// web client uses; false = legacy JSON transport, where MAX hides polls behind a
 	// bare UNSUPPORTED attach (over binary they arrive in full).
 	MaxBinary *bool `json:"max_binary,omitempty"` // nil (absent) = on
+
+	// MaxTransport picks how the bridge talks to MAX: "tcp" = the desktop
+	// client's TCP endpoint (browserless sign-in; no browser, no cookies), "ws" =
+	// the web client's WebSocket (token imported from a browser), ""/"auto" =
+	// follow the stored token (a token minted by the bridge's own SMS sign-in →
+	// tcp, anything else → ws).
+	MaxTransport string `json:"max_transport,omitempty"`
 
 	// Dinner: сайт обедов (dinner.016.help). Мост сам опрашивает сайт и
 	// отправляет готовые сообщения в группу MAX (внешний IP не нужен).
@@ -151,9 +159,8 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	if cfg.Phone == "" {
-		return nil, fmt.Errorf("phone is required (config.phone or MAX_PHONE)")
-	}
+	// The MAX phone is not required here: signing in to MAX happens from the
+	// Telegram bot (/login), which asks for it.
 	if cfg.TelegramBotToken == "" {
 		return nil, fmt.Errorf("telegram_bot_token is required (TELEGRAM_BOT_TOKEN)")
 	}
@@ -179,19 +186,28 @@ func LoadRaw(path string) (*Config, error) {
 // Complete reports whether the required fields are set. TelegramGroupID is not
 // required here — it is auto-detected at runtime and persisted.
 func (c *Config) Complete() bool {
-	return c.Phone != "" && c.TelegramBotToken != ""
+	return c.TelegramBotToken != ""
 }
 
-// LoadPartial returns a config for the console (only phone/ws matter for SMS auth).
+// LoadPartial returns a config for the console's MAX sign-in (the phone may be
+// empty — the console asks for it).
 func LoadPartial(path string) (*Config, error) {
-	cfg, err := load(path)
-	if err != nil {
-		return nil, err
+	return load(path)
+}
+
+// UseTCP reports whether the bridge should talk to MAX over the desktop TCP
+// transport. Unless max_transport forces one, it follows the stored token: no
+// token yet → TCP (the browserless sign-in is the default path); a token minted
+// by that sign-in ("desktop") → TCP; any other token (browser import, or a
+// state file from before token kinds existed) → the web WebSocket.
+func (c *Config) UseTCP(hasToken bool, tokenKind string) bool {
+	switch strings.ToLower(strings.TrimSpace(c.MaxTransport)) {
+	case "tcp":
+		return true
+	case "ws":
+		return false
 	}
-	if cfg.Phone == "" {
-		return nil, fmt.Errorf("phone is required for SMS auth (config.phone or MAX_PHONE)")
-	}
-	return cfg, nil
+	return !hasToken || tokenKind == "desktop"
 }
 
 func applyEnv(cfg *Config) {

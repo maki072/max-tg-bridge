@@ -50,6 +50,10 @@ type Bridge struct {
 
 	promptMu sync.Mutex
 	prompts  map[int64]prompt // admin user id -> panel question awaiting an answer
+
+	loginMu sync.Mutex
+	logins  map[int64]*loginFlow // admin user id -> MAX sign-in in progress (login.go)
+	botName string               // the bot's @username, for deep links
 }
 
 func New(max *maxapi.Client, bot *tg.Bot, st *store.Store, cfg *config.Config, configPath string) *Bridge {
@@ -69,6 +73,11 @@ func New(max *maxapi.Client, bot *tg.Bot, st *store.Store, cfg *config.Config, c
 	b.al.mu.Lock()
 	b.armDownTimerLocked(2 * time.Minute)
 	b.al.mu.Unlock()
+	go func() { // the bot's username, for the "sign in" deep link in the group panel
+		if n, err := bot.GetMe(); err == nil {
+			b.setBotName(n)
+		}
+	}()
 	return b
 }
 
@@ -741,12 +750,19 @@ func (b *Bridge) handleUpdate(u tg.Update) {
 
 	// 1. Приватные сообщения боту (Личка) — только для Администраторов группы!
 	if msg.Chat.Type == "private" {
+		if b.bot.GroupID() == 0 {
+			b.reply(msg.Chat.ID, "Бот ещё не привязан к группе. Добавьте его администратором в группу с включёнными темами и напишите там любое сообщение — потом вернитесь сюда и отправьте /login.")
+			return
+		}
 		if !b.isAdmin(msg.From.ID) {
 			_ = b.bot.SendMenu(msg.Chat.ID, "У вас нет прав администратора в привязанной группе MAX-TG.", tg.ReplyKeyboardMarkup{ResizeKeyboard: true})
 			return
 		}
 		if msg.Text != "" {
 			if b.takePrompt(msg.From.ID, msg.Text) { // an answer to a panel question
+				return
+			}
+			if b.handleLoginInput(msg) { // /login and its steps
 				return
 			}
 			b.handleAdminPM(msg.Chat.ID, msg.Text)
@@ -769,9 +785,10 @@ func (b *Bridge) handleUpdate(u tg.Update) {
 			if b.takePrompt(msg.From.ID, msg.Text) {
 				return
 			}
-			if cmd := commandName(msg.Text); cmd == "/panel" {
-				b.sendPanel(msg.Chat.ID)
-			} else if reply := b.processCommand(msg.Text); reply != "" {
+			if b.handleContextCommand(msg.Chat.ID, msg.Text) {
+				return
+			}
+			if reply := b.processCommand(msg.Text); reply != "" {
 				b.notify(reply)
 			}
 		}
@@ -959,7 +976,8 @@ func (b *Bridge) handleAdminPM(chatID int64, text string) {
 		Keyboard: [][]tg.KeyboardButton{
 			{{Text: "🎛 Панель"}, {Text: "📊 Статус"}},
 			{{Text: "⏸ Пауза MAX"}, {Text: "▶️ Возобновить MAX"}, {Text: "🔄 Перезапустить"}},
-			{{Text: "📱 SMS Авторизация (рекомендуется)"}},
+			{{Text: "🔐 Вход в MAX"}, {Text: "🛠 Настройки"}},
+			{{Text: "🌐 Вход через веб-клиент (запасной)"}},
 			{{Text: "📄 Логи службы"}, {Text: "📋 Сырой лог (Debug)"}},
 			{{Text: "🩺 Диагностика MAX"}, {Text: "💬 Тестовое сообщение"}},
 			{{Text: "🌐 Кража токена из браузера (Опасно, могут пропасть пуши)"}},
@@ -980,8 +998,10 @@ func (b *Bridge) handleAdminPM(chatID int64, text string) {
 		cmd = "/status"
 	case "🔄 Перезапустить":
 		cmd = "/restart"
-	case "📱 SMS Авторизация (рекомендуется)":
-		cmd = "/auth"
+	case "🛠 Настройки":
+		cmd = "/settings"
+	case "🌐 Вход через веб-клиент (запасной)":
+		cmd = "/authweb"
 	case "📄 Логи службы":
 		cmd = "/log"
 	case "📋 Сырой лог (Debug)":
@@ -999,8 +1019,7 @@ func (b *Bridge) handleAdminPM(chatID int64, text string) {
 		}
 	}
 
-	if commandName(cmd) == "/panel" {
-		b.sendPanel(chatID)
+	if b.handleContextCommand(chatID, cmd) {
 		return
 	}
 	reply := b.processCommand(cmd)
@@ -1059,13 +1078,18 @@ func (b *Bridge) processCommand(text string) string {
 		}
 		return b.tailLog(n)
 
-	case "/auth":
+	case "/authweb":
+		// The older sign-in as the WEB client (WebSocket; may ask for a captcha
+		// and doesn't support a 2FA password). /login is the browserless one.
 		phone := b.cfg.Phone
 		if len(fields) > 1 {
 			phone = fields[1]
 		}
+		if phone == "" {
+			return "Использование: /authweb +7XXXXXXXXXX"
+		}
 		go b.runSmsAuth(phone)
-		return fmt.Sprintf("⏳ Запущена SMS-авторизация для %s.\nЖду код (отправьте его сюда сообщением 6 цифр).", phone)
+		return fmt.Sprintf("⏳ Запущена SMS-авторизация (веб-клиент) для %s.\nЖду код (отправьте его сюда сообщением 6 цифр).", phone)
 
 	case "/code":
 		if len(fields) < 2 {
