@@ -121,7 +121,11 @@ type AuthResult struct {
 
 // NewAuthSession connects to MAX as the desktop client and completes INIT.
 func NewAuthSession(deviceID string) (*AuthSession, error) {
-	c := newClient(Options{TCP: true, DeviceID: deviceID})
+	return newAuthSession(deviceID, TCPVersion())
+}
+
+func newAuthSession(deviceID, appVersion string) (*AuthSession, error) {
+	c := newClient(Options{TCP: true, DeviceID: deviceID, AppVersion: appVersion})
 	closeFn, err := c.dial()
 	if err != nil {
 		return nil, err

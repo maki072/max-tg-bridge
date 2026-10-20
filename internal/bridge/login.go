@@ -147,17 +147,29 @@ func (b *Bridge) loginSendSMS(chatID, userID int64, rawPhone string) {
 		b.reply(chatID, "❌ Не похоже на номер телефона. Пришлите в формате +7XXXXXXXXXX или /cancel.")
 		return
 	}
-	sess, err := maxapi.NewAuthSession(b.st.EnsureDeviceID())
+	tried := false
+	sess, err := maxapi.StartSMSAuth(b.st.EnsureDeviceID(), phone, func(v string) {
+		if !tried {
+			tried = true
+			b.reply(chatID, "🧬 MAX считает версию приложения устаревшей — подбираю подходящую…")
+		}
+	})
 	if err != nil {
-		b.loginEnd(userID)
-		b.reply(chatID, "❌ Не удалось подключиться к MAX: "+maxapi.DescribeError(err)+"\nПопробуйте позже: /login.")
+		if maxapi.IsOutdatedError(err) {
+			b.loginEnd(userID)
+			hint := "Откройте /settings → «Версия MAX» и включите автоподбор или укажите версию вручную."
+			if b.cfg.MaxAppVersion == "" {
+				hint = "Автоподбор не нашёл подходящую версию — укажите её вручную: /settings → «Версия MAX»."
+			}
+			b.reply(chatID, "❌ "+maxapi.DescribeError(err)+"\n"+hint)
+			return
+		}
+		b.loginSet(userID, &loginFlow{step: "phone", chatID: chatID})
+		b.reply(chatID, "❌ "+maxapi.DescribeError(err)+"\nПроверьте номер и пришлите ещё раз, или /cancel.")
 		return
 	}
-	if err := sess.RequestSMS(phone); err != nil {
-		sess.Close()
-		b.loginSet(userID, &loginFlow{step: "phone", chatID: chatID})
-		b.reply(chatID, "❌ "+err.Error()+"\nПроверьте номер и пришлите ещё раз, или /cancel.")
-		return
+	if tried {
+		b.reply(chatID, "🧬 Версия подобрана: "+maxapi.TCPVersion())
 	}
 	b.loginSet(userID, &loginFlow{step: "code", chatID: chatID, phone: phone, sess: sess})
 	b.reply(chatID, "📲 Код отправлен по SMS на "+maskPhone(phone)+". Пришлите его сюда одним сообщением — я сразу удалю его из чата.")

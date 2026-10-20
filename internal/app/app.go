@@ -75,7 +75,12 @@ func (p *Program) run() {
 		log.Printf("[app] MAX transport: web WebSocket (token from a browser)")
 	}
 
-	maxapi.AppVersionOverride = p.cfg.MaxAppVersion
+	maxapi.ConfigureVersion(p.cfg.MaxAppVersion, p.cfg.MaxAppVersionAuto, func(v string) {
+		p.cfg.MaxAppVersionAuto = v
+		if err := config.Save(p.configPath, p.cfg); err != nil {
+			log.Printf("[app] saving the found app version failed: %v", err)
+		}
+	})
 	maxClient := maxapi.New(maxapi.Options{
 		URL:              p.cfg.MaxWSURL,
 		Phone:            p.cfg.Phone,

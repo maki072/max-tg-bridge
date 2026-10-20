@@ -88,13 +88,7 @@ func readTCPRaw(r *bufio.Reader) ([]byte, error) {
 }
 
 // tcpUserAgent is what INIT presents over TCP: the MAX desktop client.
-func tcpUserAgent() map[string]any {
-	// MAX answers "Приложение устарело" to a desktop version it no longer
-	// supports; config "max_app_version" lets that be bumped without a rebuild.
-	ver := "26.24.0"
-	if AppVersionOverride != "" {
-		ver = AppVersionOverride
-	}
+func tcpUserAgent(ver string) map[string]any {
 	return map[string]any{
 		"deviceType":  "DESKTOP",
 		"appVersion":  ver,

@@ -235,17 +235,19 @@ func smsAuth(configPath string, in *bufio.Reader) {
 		phone = "+" + phone
 	}
 	fmt.Println("Connecting to MAX (desktop client, no browser) ...")
-	sess, err := maxapi.NewAuthSession(st.EnsureDeviceID())
+	maxapi.ConfigureVersion(cfg.MaxAppVersion, cfg.MaxAppVersionAuto, func(v string) {
+		cfg.MaxAppVersionAuto = v
+		_ = config.Save(configPath, cfg)
+	})
+	fmt.Printf("Requesting SMS for %s ...\n", phone)
+	sess, err := maxapi.StartSMSAuth(st.EnsureDeviceID(), phone, func(v string) {
+		fmt.Printf("App version refused as outdated, trying %s ...\n", v)
+	})
 	if err != nil {
-		fmt.Printf("Connect failed: %v\n", maxapi.DescribeError(err))
+		fmt.Printf("Failed: %v\n", maxapi.DescribeError(err))
 		return
 	}
 	defer sess.Close()
-	fmt.Printf("Requesting SMS for %s ...\n", phone)
-	if err := sess.RequestSMS(phone); err != nil {
-		fmt.Printf("Failed: %v\n", err)
-		return
-	}
 	res, needPassword, hint, err := sess.VerifyCode(ask(in, "Enter MAX SMS code", ""))
 	if err != nil {
 		fmt.Printf("Failed: %v\n", err)

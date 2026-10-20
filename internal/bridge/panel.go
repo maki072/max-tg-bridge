@@ -167,6 +167,8 @@ func (b *Bridge) answerPrompt(p prompt, text string) {
 		b.createGroupFromPrompt(p, text)
 	case "set_proxy":
 		b.applyProxy(p, text)
+	case "set_version":
+		b.applyVersion(p, text)
 	}
 }
 

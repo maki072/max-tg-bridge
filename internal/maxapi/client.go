@@ -185,7 +185,9 @@ type Client struct {
 	pendMu  sync.Mutex
 
 	tcp              bool // desktop TCP transport (tcp.go) instead of a WebSocket
-	tcpConn          net.Conn
+	appVersion       string // pinned desktop appVersion ("" = TCPVersion())
+	verBumps         int    // consecutive auto version bumps since the last good LOGIN
+	tcpConn         net.Conn
 	tcpR             *bufio.Reader
 	saveDesktopToken func(deviceID, token string)
 	selfID           int64
@@ -235,6 +237,8 @@ type Options struct {
 	// device type) — the browserless path; tokens minted by AuthSession work
 	// with it. Takes precedence over URL/Binary.
 	TCP bool
+	// AppVersion pins the desktop appVersion for this client (default: TCPVersion()).
+	AppVersion string
 	// SaveDesktopToken persists a session token rotated by LOGIN over TCP.
 	SaveDesktopToken func(deviceID, token string)
 	AllowSMS         bool
@@ -282,6 +286,7 @@ func newClient(o Options) *Client {
 		pending:          make(map[int]chan *Frame),
 		pendOp:           make(map[int]int),
 		tcp:              o.TCP,
+		appVersion:       o.AppVersion,
 		saveDesktopToken: o.SaveDesktopToken,
 		chatName:         make(map[int64]string),
 		userName:         make(map[int64]string),
@@ -319,6 +324,11 @@ func (c *Client) Run() {
 		// a flaky-but-working link reconnects promptly instead of ramping to 30s.
 		if time.Since(start) > 60*time.Second {
 			attempt = 0
+		}
+		if errors.Is(err, errVersionBumped) {
+			log.Printf("[max] session ended: %v", err)
+			attempt = 0
+			continue // reconnect at once with the next app version
 		}
 		if err != nil {
 			attempt++
@@ -405,6 +415,9 @@ func (c *Client) session() (sessErr error) {
 	}()
 
 	if err := c.init(); err != nil {
+		if c.bumpVersion(err) {
+			return fmt.Errorf("init: %w", errVersionBumped)
+		}
 		c.noteBinaryFailure(err)
 		return fmt.Errorf("init: %w", err)
 	}
@@ -417,9 +430,16 @@ func (c *Client) session() (sessErr error) {
 	}
 
 	if err := c.login(); err != nil {
+		if c.bumpVersion(err) {
+			return fmt.Errorf("login: %w", errVersionBumped)
+		}
 		c.noteBinaryFailure(err)
 		c.token = ""
 		return fmt.Errorf("login: %w", err)
+	}
+	if c.tcp && c.verBumps > 0 {
+		c.verBumps = 0
+		announceVersion(TCPVersion())
 	}
 	c.binFails = 0
 	transport := "JSON"
@@ -616,9 +636,13 @@ func (c *Client) init() error {
 	// Keep the INIT userAgent consistent with the Firefox handshake (do not stamp
 	// in the captured Edge UA) — this matches the Diagnose probe that gets ACKed.
 	if c.tcp {
-		log.Printf("[max] INIT as DESKTOP over TCP (%s)", TCPAddr)
+		ver := c.appVersion
+		if ver == "" {
+			ver = TCPVersion()
+		}
+		log.Printf("[max] INIT as DESKTOP over TCP (%s) appVersion=%s", TCPAddr, ver)
 		_, err := c.request(OpInit, map[string]any{
-			"userAgent":       tcpUserAgent(),
+			"userAgent":       tcpUserAgent(ver),
 			"deviceId":        c.deviceID,
 			"clientSessionId": time.Now().UnixNano() % 1000,
 		}, 15*time.Second)

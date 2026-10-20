@@ -9,6 +9,7 @@ import (
 
 	"maxtg/internal/config"
 	"maxtg/internal/installer"
+	"maxtg/internal/maxapi"
 	"maxtg/internal/store"
 	"maxtg/internal/tg"
 )
@@ -72,6 +73,25 @@ func (b *Bridge) transportLabel() string {
 	return label
 }
 
+// versionLabel describes how the MAX app version is chosen.
+func (b *Bridge) versionLabel() string {
+	switch {
+	case b.cfg.MaxAppVersion != "":
+		return b.cfg.MaxAppVersion + " (задана вручную)"
+	case b.cfg.MaxAppVersionAuto != "":
+		return b.cfg.MaxAppVersionAuto + " (подобрана автоматически)"
+	}
+	return "автоподбор (начиная с " + maxapi.TCPVersion() + ")"
+}
+
+func (b *Bridge) versionView() view {
+	return view{"🧬 Версия приложения MAX: " + b.versionLabel() + "\n\n" +
+		"MAX отвечает «Приложение устарело», если мост представляется слишком старой версией. " +
+		"Автоподбор сам перебирает версии выше, пока MAX не примет одну из них, и запоминает её. " +
+		"Вручную можно указать версию из десктопного MAX (Настройки → О программе).",
+		kbd(row(btn("🔎 Автоподбор", cbPanel+"verauto"), btn("✏️ Указать вручную", cbPanel+"verman")), backBtn("set"))}
+}
+
 func (b *Bridge) settingsView() view {
 	_, token, _, _ := b.st.GetCredentials()
 	account := "не авторизован — /login"
@@ -94,6 +114,7 @@ func (b *Bridge) settingsView() view {
 	text := "🛠 Настройки\n" +
 		"• MAX: " + account + "\n" +
 		"• Транспорт: " + b.transportLabel() + "\n" +
+		"• Версия MAX: " + b.versionLabel() + "\n" +
 		"• Прокси Telegram: " + maskProxy(b.cfg.TelegramProxy) + "\n" +
 		fmt.Sprintf("• История в новой теме: %d сообщ.\n", b.cfg.HistoryCount) +
 		fmt.Sprintf("• Дозагрузка после простоя: %d сообщ. на чат\n", b.cfg.SyncCount) +
@@ -115,6 +136,7 @@ func (b *Bridge) settingsView() view {
 	return view{text, kbd(
 		row(btn("🔐 Вход в MAX", cbPanel+"login"), btn("🚪 Выйти из MAX", cbPanel+"logout")),
 		row(btn("🌐 Прокси Telegram", cbPanel+"proxy"), btn("🔁 Транспорт", cbPanel+"tr")),
+		row(btn("🧬 Версия MAX", cbPanel+"ver")),
 		row(btn(toggle, cbPanel+"auto")),
 		row(btn("📚 История:", cbPanel+"set"), hist(0), hist(20), hist(50), hist(100)),
 		row(btn("🔄 Дозагрузка:", cbPanel+"set"), syncB(0), syncB(50), syncB(200)),
@@ -161,6 +183,21 @@ func (b *Bridge) settingsAction(action, rest string, cq *tg.CallbackQuery, show 
 		show(b.settingsView())
 		b.notify("🔁 Транспорт MAX изменён — мост перезапускается.")
 		go b.restart()
+	case "ver":
+		show(b.versionView())
+		answer("", false)
+	case "verauto":
+		b.cfg.MaxAppVersion, b.cfg.MaxAppVersionAuto = "", ""
+		b.saveConfig()
+		answer("Автоподбор включён, перезапускаюсь…", false)
+		show(b.versionView())
+		b.notify("🧬 Версия MAX: автоподбор — мост перезапускается.")
+		go b.restart()
+	case "verman":
+		b.setPrompt(cq.From.ID, prompt{kind: "set_version", chatID: chatID, panelMsg: cq.Message.MessageID})
+		show(view{"✏️ Пришлите версию приложения MAX в формате 26.24.0 (из десктопного MAX: Настройки → О программе).\n\n/cancel — отмена",
+			kbd(backBtn("ver"))})
+		answer("", false)
 	case "auto":
 		var err error
 		if installer.AutostartRegistered() {
@@ -195,6 +232,19 @@ func (b *Bridge) saveConfig() {
 	if err := config.Save(b.configPath, b.cfg); err != nil {
 		log.Printf("[settings] saving config failed: %v", err)
 	}
+}
+
+// applyVersion saves a MAX app version typed into the panel and restarts.
+func (b *Bridge) applyVersion(p prompt, text string) {
+	v := strings.TrimSpace(text)
+	if !maxapi.ValidVersion(v) {
+		b.showPanelView(p, view{"❌ Не похоже на версию. Пример: 26.24.0", kbd(row(btn("✏️ Ещё раз", cbPanel+"verman")), backBtn("ver"))})
+		return
+	}
+	b.cfg.MaxAppVersion = v
+	b.saveConfig()
+	b.showPanelView(p, view{"✅ Версия MAX сохранена: " + v + ". Перезапускаюсь…", kbd(backBtn("set"))})
+	go b.restart()
 }
 
 // applyProxy validates a proxy typed into the panel (a real getMe through it),

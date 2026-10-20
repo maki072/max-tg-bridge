@@ -56,9 +56,12 @@ type Config struct {
 	// generous; 0 = off (no catch-up resync on reconnect).
 	SyncCount int `json:"sync_count"`
 
-	// MaxAppVersion overrides the appVersion sent to MAX in INIT (empty = built-in
-	// default), e.g. to match the current web.max.ru version.
-	MaxAppVersion string `json:"max_app_version"`
+	// MaxAppVersion pins the appVersion sent to MAX in INIT (e.g. the version shown
+	// in the desktop app's "About"). Empty = automatic: when MAX answers "app is
+	// outdated" the bridge tries newer versions and keeps the one that works in
+	// MaxAppVersionAuto.
+	MaxAppVersion     string `json:"max_app_version"`
+	MaxAppVersionAuto string `json:"max_app_version_auto,omitempty"`
 
 	// MaxBinary (default on) selects the binary msgpack transport the
 	// web client uses; false = legacy JSON transport, where MAX hides polls behind a
