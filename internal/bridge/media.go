@@ -43,13 +43,32 @@ func httpDownload(url string, maxBytes int64) ([]byte, string, error) {
 // a corrupt, unplayable partial file. Used for video/audio, which can be big.
 func httpDownloadCapped(url string, maxBytes int64) (data []byte, contentType string, tooLarge bool, err error) {
 	client := &http.Client{Timeout: 5 * time.Minute}
-	resp, err := client.Get(url)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, "", false, err
+	}
+	// MAX's video CDN can reject header-less Go requests with a 400.
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+	req.Header.Set("Referer", "https://web.max.ru/")
+	req.Header.Set("Origin", "https://web.max.ru")
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, "", false, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, "", false, fmt.Errorf("http %d", resp.StatusCode)
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
+		host, path := url, ""
+		if i := strings.Index(url, "://"); i >= 0 {
+			host = url[i+3:]
+		}
+		if i := strings.IndexAny(host, "/?"); i >= 0 {
+			host, path = host[:i], host[i:]
+		}
+		if len(path) > 60 {
+			path = path[:60] + "…"
+		}
+		return nil, "", false, fmt.Errorf("http %d (%s%s) body=%q", resp.StatusCode, host, path, snippet)
 	}
 	ct := resp.Header.Get("Content-Type")
 	if resp.ContentLength > maxBytes {
