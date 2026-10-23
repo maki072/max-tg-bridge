@@ -807,25 +807,42 @@ func (c *Client) ChatIcon(chatID int64) string {
 // History returns up to count recent messages of a chat (oldest-first), enriched
 // with names, for backfilling a freshly created topic.
 func (c *Client) History(chatID int64, count int) []IncomingMessage {
+	out, _, _, _ := c.HistoryPage(chatID, 0, count)
+	return out
+}
+
+// HistoryPage returns one page of up to count messages older than from (ms since
+// epoch; 0 = now), oldest-first, enriched like History. Messages without text or
+// media are left out of the page, so the page also reports what the server really
+// sent: its oldest message time and message count — a caller paging backwards
+// continues from oldest, and stops when raw is 0.
+func (c *Client) HistoryPage(chatID, from int64, count int) (page []IncomingMessage, oldest int64, raw int, err error) {
 	if count <= 0 {
-		return nil
+		return nil, 0, 0, nil
+	}
+	if from <= 0 {
+		from = time.Now().UnixMilli()
 	}
 	resp, err := c.request(OpGetHistory, map[string]any{
 		"chatId": chatID, "forward": 0, "backward": count,
 		"backwardTime": 0, "forwardTime": 0, "getChat": false,
-		"from": time.Now().UnixMilli(), "getMessages": true, "interactive": false,
+		"from": from, "getMessages": true, "interactive": false,
 	}, 20*time.Second)
 	if err != nil {
-		return nil
+		return nil, 0, 0, err
 	}
 	var r struct {
 		Messages []msgBody `json:"messages"`
 	}
-	if json.Unmarshal(resp.Payload, &r) != nil {
-		return nil
+	if err := json.Unmarshal(resp.Payload, &r); err != nil {
+		return nil, 0, 0, err
 	}
+	raw = len(r.Messages)
 	out := make([]IncomingMessage, 0, len(r.Messages))
 	for _, m := range r.Messages {
+		if m.Time > 0 && (oldest == 0 || m.Time < oldest) {
+			oldest = m.Time
+		}
 		text, att, forwarded, replyToID := parseLink(m.Link, m.Text, toAttachments(m.Attaches))
 		if strings.TrimSpace(text) == "" && len(att) == 0 {
 			continue
@@ -855,7 +872,7 @@ func (c *Client) History(chatID int64, count int) []IncomingMessage {
 	// backfill needs), so sorting by real timestamp is the only way to be sure
 	// regardless of whatever order the server happens to send.
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Time < out[j].Time })
-	return out
+	return out, oldest, raw, nil
 }
 
 // SendFile uploads a file to MAX storage and posts it as a message attachment.

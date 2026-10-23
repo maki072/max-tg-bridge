@@ -1,7 +1,6 @@
 package store
 
 import (
-	"database/sql"
 	"encoding/json"
 	"os"
 	"sync"
@@ -10,7 +9,7 @@ import (
 )
 
 // Store is the persisted state: MAX credentials, chat<->topic mapping,
-// Telegram update offset, and a bounded set of seen message IDs for dedupe.
+// Telegram update offset, and the per-chat history cursors (LastSync).
 type Store struct {
 	path string
 	mu   sync.Mutex
@@ -22,18 +21,14 @@ type Store struct {
 	TokenKind string          `json:"token_kind"` // "desktop" (browserless sign-in) or "web"; empty = legacy web
 	TgOffset  int64           `json:"tg_offset"`
 	ChatTopic map[string]int  `json:"chat_topic"` // maxChatID -> tg thread id
-	Seen      []string        `json:"seen"` // legacy bounded dedupe list; imported into delivered.db once, then emptied
-	seenSet   map[string]bool `json:"-"`
 
-	db *sql.DB `json:"-"` // delivered-messages registry (delivered.go)
-
-	// LastSync is a per-chat baseline: the timestamp (ms) of the newest MAX
-	// message that was already in Telegram before the delivered-messages
-	// registry existed (or when the chat was first seen with unknown history).
-	// History at or before it is never re-posted. It is not advanced afterwards:
-	// everything newer is tracked per message in the registry, so a message whose
-	// delivery failed can never be skipped just because a later one succeeded.
-	LastSync map[string]int64 `json:"last_sync"` // maxChatID -> baseline message time (ms)
+	// LastSync is the per-chat history cursor: the MAX server time (ms) of the
+	// newest message of that chat already delivered to Telegram. Nothing is
+	// stored per message. The bridge keeps one invariant: the cursor never passes
+	// a message that was not delivered — it moves only after a successful post and
+	// only while the chat is caught up (see catchup.go) — so everything after it
+	// is exactly what a resync still has to deliver.
+	LastSync map[string]int64 `json:"last_sync"` // maxChatID -> cursor (ms)
 
 	// MsgLinks is a bounded, bidirectional map between a MAX message
 	// (chatID+messageID) and the Telegram message that mirrors it, used for
@@ -74,7 +69,6 @@ func Load(path string) (*Store, error) {
 	s := &Store{
 		path:      path,
 		ChatTopic: make(map[string]int),
-		seenSet:   make(map[string]bool),
 		byMax:     make(map[string]int),
 		byTg:      make(map[int64]int),
 		LastSync:  make(map[string]int64),
@@ -84,9 +78,6 @@ func Load(path string) (*Store, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			if err := s.openDelivered(); err != nil {
-				return nil, err
-			}
 			return s, nil
 		}
 		return nil, err
@@ -106,15 +97,8 @@ func Load(path string) (*Store, error) {
 	if s.Titles == nil {
 		s.Titles = make(map[string]string)
 	}
-	s.seenSet = make(map[string]bool, len(s.Seen))
-	for _, id := range s.Seen {
-		s.seenSet[id] = true
-	}
 	s.rebuildMsgIndex()
 	s.path = path
-	if err := s.openDelivered(); err != nil {
-		return nil, err
-	}
 	return s, nil
 }
 
@@ -275,7 +259,6 @@ func (s *Store) RemoveChat(maxChatID string) int {
 	thread := s.ChatTopic[maxChatID]
 	delete(s.ChatTopic, maxChatID)
 	delete(s.LastSync, maxChatID)
-	s.forgetChat(maxChatID)
 	delete(s.Titles, maxChatID)
 	kept := s.MsgLinks[:0]
 	for _, l := range s.MsgLinks {
@@ -386,8 +369,8 @@ func (s *Store) LastSyncTime(maxChatID string) int64 {
 	return s.LastSync[maxChatID]
 }
 
-// BumpLastSync advances the stored watermark for a chat to t, unless t is not
-// newer than what's already recorded (the watermark never moves backwards).
+// BumpLastSync advances a chat's history cursor to t, unless t is not
+// newer than what is already recorded (the cursor never moves backwards).
 func (s *Store) BumpLastSync(maxChatID string, t int64) {
 	if t <= 0 {
 		return
@@ -453,4 +436,12 @@ func (s *Store) TokenKindOf() string {
 		return ""
 	}
 	return s.TokenKind
+}
+
+// HasCursor reports whether a chat has a history cursor, i.e. whether the
+// bridge knows how far its history has been delivered.
+func (s *Store) HasCursor(maxChatID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.LastSync[maxChatID] > 0
 }

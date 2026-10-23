@@ -159,8 +159,8 @@ func load(path string) (*Config, error) {
 	if cfg.SyncCount < 0 {
 		cfg.SyncCount = 0
 	}
-	if cfg.SyncCount > 200 {
-		cfg.SyncCount = 200 // matches GET_HISTORY's own practical page-size ceiling
+	if cfg.SyncCount > 1000 {
+		cfg.SyncCount = 1000 // upper bound of messages a catch-up delivers per chat
 	}
 	return cfg, nil
 }

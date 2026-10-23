@@ -32,13 +32,9 @@ type Bridge struct {
 	authActive   atomic.Bool // true while an SMS auth flow is waiting for input
 	syncing      atomic.Bool // true while SyncAllChats is running (prevents overlap)
 
-	// syncGate orders live delivery against SyncAllChats: a resync holds the
-	// write side for its whole pass, so no live MAX message can be posted into
-	// any topic (landing ahead of, or interleaved with, that chat's own
-	// not-yet-posted catch-up messages) while history is being caught up. Live
-	// delivery takes the read side, so unrelated traffic still flows normally
-	// whenever no resync is in progress.
-	syncGate sync.RWMutex
+	// cs is the per-chat locking, caught-up set and retry state behind the
+	// history cursors (catchup.go).
+	cs chatSync
 
 	// dialogMu serializes everything that creates or re-keys a chat's topic
 	// (a new MAX chat's first message, opening a dialog from Telegram, creating a
@@ -109,30 +105,11 @@ func (b *Bridge) OnMaxMessage(m maxapi.IncomingMessage) {
 	if b.st.IsBanned(chatKey) { // muted chat: no mirror, no topic
 		return
 	}
-	// Reserve the message: a live push and a resync can both see it, and only
-	// one of them may post it. The reservation is confirmed once Telegram took
-	// the message, and given back (so a resync retries it) if delivery failed.
-	claimed := m.MessageID != ""
-	if claimed && !b.st.Claim(chatKey, m.MessageID) {
-		return
-	}
-	posted := false
-	defer func() {
-		if !claimed {
-			return
-		}
-		if posted {
-			b.st.Done(chatKey, m.MessageID)
-		} else {
-			b.st.Release(m.MessageID)
-		}
-	}()
-
-	// Wait out any resync in progress for this chat's topic (see syncGate) so
-	// this live message can never jump ahead of, or interleave with, a
-	// catch-up backfill that's still being posted.
-	b.syncGate.RLock()
-	defer b.syncGate.RUnlock()
+	// One writer per chat: this message waits for a catch-up of its chat that is
+	// still being posted, so it can never land ahead of, or between, older
+	// messages (see catchup.go).
+	unlock := b.lockChat(chatKey)
+	defer unlock()
 
 	threadID, ok := b.st.Topic(chatKey)
 	if !ok {
@@ -151,14 +128,22 @@ func (b *Bridge) OnMaxMessage(m maxapi.IncomingMessage) {
 			b.st.SetTopic(chatKey, threadID)
 			b.st.SetTitle(chatKey, m.ChatTitle)
 			b.dialogMu.Unlock()
-			b.onNewTopic(threadID, m.ChatID) // avatar + history backfill
+			b.onNewTopic(threadID, chatKey, m.ChatID) // avatar + history backfill
 		} else {
 			b.dialogMu.Unlock()
 		}
 	}
 	b.st.SetTitle(chatKey, m.ChatTitle)
 
-	posted = b.postMessage(threadID, m)
+	// Whatever happened while we were offline goes out first and in order; the
+	// cursor moves only while the chat is caught up. If the history could not be
+	// read, the live message is still delivered — without moving the cursor, and
+	// the link it gets keeps the later catch-up from posting it again.
+	_, caught := b.ensureCaughtUp(chatKey, m.ChatID, threadID)
+	if !b.deliverOne(threadID, chatKey, m, false, caught) {
+		b.markDirty(chatKey)
+		b.requestRetry()
+	}
 }
 
 // postMessage renders one MAX message into a topic (header + text + media),
@@ -247,106 +232,17 @@ func (b *Bridge) postMessage(threadID int, m maxapi.IncomingMessage) bool {
 	return !textFailed || linked
 }
 
-// onNewTopic posts the chat avatar and backfills recent history into a new topic.
-func (b *Bridge) onNewTopic(threadID int, chatID int64) {
+// onNewTopic posts the chat avatar and backfills recent history into a new
+// topic, advancing the chat's cursor as it goes. Called with the chat's lock held.
+func (b *Bridge) onNewTopic(threadID int, chatKey string, chatID int64) {
 	if url := b.max.ChatIcon(chatID); url != "" {
 		b.forwardAttachment(threadID, "🖼", maxapi.Attachment{Kind: "photo", URL: url}, 0)
 	}
-	b.backfillHistory(threadID, chatID, b.cfg.HistoryCount)
-}
-
-// backfillHistory posts up to count of the chat's most recent MAX messages
-// into threadID, in chronological order. A message is skipped when it is at or
-// before the chat's baseline (it was in Telegram before the delivered-messages
-// registry existed) or when the registry already has it (see store/delivered.go;
-// the claim also keeps a concurrent live push from posting it twice). A message
-// whose text could not be sent is released, so the next resync retries it. Used
-// both when a topic is first created and, via SyncAllChats, to catch an
-// already-mapped chat up after a reconnect. Locking is the caller's
-// responsibility (see syncGate). Returns how many were posted.
-func (b *Bridge) backfillHistory(threadID int, chatID int64, count int) int {
-	chatKey := strconv.FormatInt(chatID, 10)
-	baseline := b.st.LastSyncTime(chatKey)
-	posted := 0
-	for _, hm := range b.max.History(chatID, count) {
-		if baseline > 0 && hm.Time > 0 && hm.Time <= baseline {
-			continue // delivered before the registry existed
+	for _, hm := range b.max.History(chatID, b.cfg.HistoryCount) {
+		if !b.deliverOne(threadID, chatKey, hm, true, true) {
+			b.requestRetry() // the rest arrives with the catch-up
+			return
 		}
-		if !b.st.Claim(chatKey, hm.MessageID) {
-			continue
-		}
-		b.max.ResolveAttachments(&hm)
-		if b.postMessage(threadID, hm) {
-			b.st.Done(chatKey, hm.MessageID)
-			posted++
-		} else {
-			b.st.Release(hm.MessageID)
-		}
-	}
-	return posted
-}
-
-// baselineChat records a mapped chat whose delivery history is unknown (no
-// registry rows, no baseline — e.g. a state file restored without it) as
-// already delivered: its recent history is marked and not posted. Re-posting
-// "everything not known" would flood the topic with old messages.
-func (b *Bridge) baselineChat(chatID int64, count int) int {
-	chatKey := strconv.FormatInt(chatID, 10)
-	var newest int64
-	n := 0
-	for _, hm := range b.max.History(chatID, count) {
-		b.st.MarkDelivered(chatKey, hm.MessageID)
-		if hm.Time > newest {
-			newest = hm.Time
-		}
-		n++
-	}
-	if newest > 0 {
-		b.st.BumpLastSync(chatKey, newest)
-	}
-	return n
-}
-
-// SyncAllChats re-checks recent history for every MAX chat that already has a
-// mapped Telegram topic and posts anything not yet delivered. Wired as the
-// MAX client's OnConnect hook (see app.go), it runs after the initial connect
-// AND every reconnect — live WS pushes only ever cover messages sent while
-// the session is actually connected, so this is what recovers anything sent
-// while the service (or the machine) was off. Holds syncGate's write side for
-// the whole pass so no live message can be posted (into any topic) while
-// history is being caught up — otherwise a live message can land ahead of, or
-// interleaved with, its own chat's still-in-flight catch-up batch, which is
-// what makes messages show up out of order. Already-delivered messages are
-// skipped (per-chat watermark, then the Seen set), so a repeated run is a
-// cheap no-op rather than a source of duplicates.
-func (b *Bridge) SyncAllChats() {
-	if b.bot.GroupID() == 0 || b.cfg.SyncCount <= 0 {
-		return
-	}
-	if !b.syncing.CompareAndSwap(false, true) {
-		return // a sync is already in progress (e.g. two reconnects in a row)
-	}
-	defer b.syncing.Store(false)
-
-	b.syncGate.Lock()
-	defer b.syncGate.Unlock()
-
-	topics := b.st.AllTopics()
-	total := 0
-	for chatKey, threadID := range topics {
-		chatID, err := strconv.ParseInt(chatKey, 10, 64)
-		if err != nil {
-			continue
-		}
-		if !b.st.ChatTracked(chatKey) {
-			n := b.baselineChat(chatID, b.cfg.SyncCount)
-			log.Printf("[bridge] sync: chat %s had no delivery record; marked its last %d message(s) as delivered instead of re-posting them", chatKey, n)
-			continue
-		}
-		total += b.backfillHistory(threadID, chatID, b.cfg.SyncCount)
-	}
-	if total > 0 {
-		log.Printf("[bridge] sync: backfilled %d missed message(s) across %d chat(s)", total, len(topics))
 	}
 }
 
@@ -897,6 +793,12 @@ func (b *Bridge) handleUpdate(u tg.Update) {
 	// kept on the safe path too even though only voice was confirmed bad).
 	// Photo is the exception — see its case below: PHOTO_UPLOAD is a
 	// completely different, simpler flow and was confirmed working live.
+	//
+	// The chat's lock is held from the send until the message is linked, so the
+	// echo of this very message (it arrives as a MAX push) waits for the link
+	// and is then recognised as already bridged instead of posted back to us.
+	unlockChat := b.lockChat(chatKey)
+	defer unlockChat()
 	var maxMsgID string
 	switch {
 	case msg.Location != nil:
@@ -1007,7 +909,6 @@ func (b *Bridge) handleUpdate(u tg.Update) {
 		b.reportSendFailure(msg.MessageThreadID, msg.MessageID, "отправить сообщение", err)
 	}
 	if maxMsgID != "" {
-		b.st.MarkDelivered(chatKey, maxMsgID) // skip our own echo
 		b.st.LinkMessages(chatKey, maxMsgID, msg.MessageID, msg.MessageThreadID)
 	}
 }

@@ -7,7 +7,7 @@ import (
 
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
-	s, err := testLoad(t, filepath.Join(t.TempDir(), "state.json"))
+	s, err := Load(filepath.Join(t.TempDir(), "state.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -16,12 +16,12 @@ func newTestStore(t *testing.T) *Store {
 
 func TestBanUnbanPersist(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
-	s, _ := testLoad(t, path)
+	s, _ := Load(path)
 	s.Ban("10", "Класс 5А")
 	if !s.IsBanned("10") || s.IsBanned("11") {
 		t.Fatal("IsBanned wrong")
 	}
-	s2, err := testLoad(t, path)
+	s2, err := Load(path)
 	if err != nil || !s2.IsBanned("10") || s2.Bans()["10"] != "Класс 5А" {
 		t.Fatalf("ban must survive a reload: %v %+v", err, s2.Bans())
 	}

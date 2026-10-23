@@ -346,8 +346,12 @@ func (b *Bridge) webAction(r *http.Request) (any, int, error) {
 		}
 		return ok("«" + truncateRunes(title, 40) + "» снова пересылается")
 	case "history", "sync":
-		if req.N < 0 || req.N > 200 {
-			return bad("от 0 до 200")
+		maxN := 200
+		if req.Action == "sync" {
+			maxN = 1000
+		}
+		if req.N < 0 || req.N > maxN {
+			return bad("от 0 до " + strconv.Itoa(maxN))
 		}
 		if req.Action == "history" {
 			b.cfg.HistoryCount = req.N

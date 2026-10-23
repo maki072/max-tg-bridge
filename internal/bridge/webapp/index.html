@@ -102,9 +102,9 @@
 
   <h2>Настройки</h2>
   <div class="card">
-    <div class="row"><div>История в новой теме<small>сколько сообщений подтянуть при создании темы</small></div>
+    <div class="row"><div>История в новой теме<small>сколько последних сообщений подтянуть при создании темы</small></div>
       <div class="seg" id="segHist"></div></div>
-    <div class="row"><div>Дозагрузка после простоя<small>сообщений на чат при переподключении</small></div>
+    <div class="row"><div>Дозагрузка после простоя<small>максимум пропущенных сообщений на чат после простоя</small></div>
       <div class="seg" id="segSync"></div></div>
     <div class="row"><div>Транспорт MAX<small id="trLabel"></small></div>
       <div class="seg" id="segTr"></div></div>
@@ -215,7 +215,7 @@
 
     seg($("segHist"), [0, 20, 50, 100].map(function (n) { return { label: n, value: n }; }), s.history,
       function (n) { act({ action: "history", n: n }); });
-    seg($("segSync"), [0, 50, 200].map(function (n) { return { label: n, value: n }; }), s.sync,
+    seg($("segSync"), [0, 50, 200, 1000].map(function (n) { return { label: n, value: n }; }), s.sync,
       function (n) { act({ action: "sync", n: n }); });
     seg($("segTr"), [{ label: "авто", value: "" }, { label: "TCP", value: "tcp" }, { label: "WS", value: "ws" }], s.transport,
       function (v) { confirmBox("Сменить транспорт? Мост перезапустится.", function () { act({ action: "transport", value: v }); }); });
