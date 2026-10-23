@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>MAX ↔ Telegram</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: var(--tg-theme-bg-color, #ffffff);
+    --bg2: var(--tg-theme-secondary-bg-color, #f1f3f5);
+    --text: var(--tg-theme-text-color, #111111);
+    --hint: var(--tg-theme-hint-color, #7a808a);
+    --link: var(--tg-theme-link-color, #2481cc);
+    --btn: var(--tg-theme-button-color, #2481cc);
+    --btn-text: var(--tg-theme-button-text-color, #ffffff);
+    --ok: #2fa84f; --warn: #d9962b; --bad: #d64545;
+    --line: color-mix(in srgb, var(--hint) 28%, transparent);
+    --r: 14px;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; background: var(--bg2); color: var(--text);
+    font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 640px; margin: 0 auto; padding: 12px 16px calc(24px + env(safe-area-inset-bottom)); }
+  h2 { margin: 22px 4px 8px; font-size: 13px; font-weight: 600; letter-spacing: .04em;
+    text-transform: uppercase; color: var(--hint); }
+  .card { background: var(--bg); border-radius: var(--r); padding: 14px 16px; }
+  .status { display: flex; gap: 12px; align-items: flex-start; }
+  .dot { flex: none; width: 12px; height: 12px; margin-top: 6px; border-radius: 50%; background: var(--hint); }
+  .dot.ok { background: var(--ok); box-shadow: 0 0 0 4px color-mix(in srgb, var(--ok) 22%, transparent); }
+  .dot.warn { background: var(--warn); box-shadow: 0 0 0 4px color-mix(in srgb, var(--warn) 22%, transparent); }
+  .dot.bad { background: var(--bad); box-shadow: 0 0 0 4px color-mix(in srgb, var(--bad) 22%, transparent); }
+  .status b { display: block; font-size: 17px; }
+  .err { margin-top: 4px; color: var(--bad); font-size: 13px; word-break: break-word; }
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 14px; }
+  .stat { background: var(--bg2); border-radius: 10px; padding: 8px 10px; }
+  .stat b { display: block; font-size: 20px; }
+  .stat span { color: var(--hint); font-size: 12px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  button { font: inherit; border: 0; border-radius: 12px; padding: 12px 14px; cursor: pointer;
+    background: var(--bg2); color: var(--text); }
+  button:active { opacity: .7; }
+  .grid.top button { background: var(--bg); padding: 14px 10px; font-weight: 500; }
+  button.primary { background: var(--btn); color: var(--btn-text); }
+  button.danger { color: var(--bad); }
+  button:disabled { opacity: .45; cursor: default; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 0; }
+  .row + .row { border-top: 1px solid var(--line); }
+  .row:first-child { padding-top: 0; } .row:last-child { padding-bottom: 0; }
+  .row small { display: block; color: var(--hint); font-size: 12px; word-break: break-word; }
+  .seg { display: inline-flex; background: var(--bg2); border-radius: 10px; padding: 2px; flex: none; }
+  .seg button { padding: 6px 11px; border-radius: 8px; background: transparent; font-size: 14px; }
+  .seg button.on { background: var(--btn); color: var(--btn-text); }
+  .field { display: flex; gap: 8px; margin-top: 8px; }
+  input[type=text] { flex: 1; min-width: 0; font: inherit; color: var(--text); background: var(--bg2);
+    border: 1px solid transparent; border-radius: 10px; padding: 10px 12px; }
+  input[type=text]:focus { outline: none; border-color: var(--btn); }
+  .muted-item { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 0; }
+  .muted-item + .muted-item { border-top: 1px solid var(--line); }
+  .muted-item span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .muted-item button { flex: none; padding: 6px 12px; font-size: 14px; }
+  .empty { color: var(--hint); font-size: 14px; }
+  pre { margin: 10px 0 0; max-height: 320px; overflow: auto; font: 12px/1.45 ui-monospace, Menlo, Consolas, monospace;
+    white-space: pre-wrap; word-break: break-word; background: var(--bg2); border-radius: 10px; padding: 10px; }
+  .sheet-back { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: none; align-items: flex-end; z-index: 5; }
+  .sheet-back.open { display: flex; }
+  .sheet { width: 100%; max-width: 640px; margin: 0 auto; background: var(--bg); border-radius: 18px 18px 0 0;
+    padding: 16px 16px calc(16px + env(safe-area-inset-bottom)); }
+  .sheet h3 { margin: 0 0 10px; font-size: 17px; }
+  .sheet button { width: 100%; margin-top: 8px; }
+  #toast { position: fixed; left: 50%; bottom: calc(20px + env(safe-area-inset-bottom)); transform: translate(-50%, 20px);
+    background: #222; color: #fff; padding: 10px 16px; border-radius: 12px; font-size: 14px; max-width: 90vw;
+    opacity: 0; pointer-events: none; transition: .2s; z-index: 9; }
+  #toast.show { opacity: .95; transform: translate(-50%, 0); }
+  #toast.bad { background: var(--bad); }
+  #gate { display: none; padding: 40px 20px; text-align: center; color: var(--hint); }
+</style>
+</head>
+<body>
+<main id="app" hidden>
+  <h2>Состояние</h2>
+  <div class="card">
+    <div class="status"><div class="dot" id="dot"></div>
+      <div><b id="stTitle">Загрузка…</b><div class="err" id="stErr"></div></div></div>
+    <div class="stats">
+      <div class="stat"><b id="nChats">–</b><span>чатов в Telegram</span></div>
+      <div class="stat"><b id="nMuted">–</b><span>заглушено</span></div>
+      <div class="stat"><b id="selfId">–</b><span>ID в MAX</span></div>
+    </div>
+  </div>
+
+  <h2>Управление</h2>
+  <div class="grid top">
+    <button id="bPause">⏸ Пауза MAX</button>
+    <button id="bResume">▶️ Возобновить</button>
+    <button id="bResync">🔄 Пересинхронизация</button>
+    <button id="bRestart" class="danger">♻️ Перезапуск моста</button>
+  </div>
+
+  <h2>Заглушенные чаты</h2>
+  <div class="card" id="muted"></div>
+
+  <h2>Настройки</h2>
+  <div class="card">
+    <div class="row"><div>История в новой теме<small>сколько сообщений подтянуть при создании темы</small></div>
+      <div class="seg" id="segHist"></div></div>
+    <div class="row"><div>Дозагрузка после простоя<small>сообщений на чат при переподключении</small></div>
+      <div class="seg" id="segSync"></div></div>
+    <div class="row"><div>Транспорт MAX<small id="trLabel"></small></div>
+      <div class="seg" id="segTr"></div></div>
+    <div class="row" style="display:block">
+      <div>Прокси Telegram<small id="proxyNow"></small></div>
+      <div class="field"><input type="text" id="proxyIn" placeholder="socks5://127.0.0.1:1080 или - чтобы убрать" autocapitalize="off" autocomplete="off" spellcheck="false">
+        <button id="bProxy">Сохранить</button></div></div>
+    <div class="row" style="display:block">
+      <div>Версия приложения MAX<small id="verNow"></small></div>
+      <div class="field"><input type="text" id="verIn" placeholder="26.29.0, пусто — автоподбор" autocapitalize="off" autocomplete="off" spellcheck="false">
+        <button id="bVer">Сохранить</button></div></div>
+  </div>
+  <p class="empty" style="margin:10px 4px 0">Вход в MAX и выход выполняются в личке бота: «🔐 Вход в MAX».</p>
+
+  <h2>Лог</h2>
+  <div class="card">
+    <div style="display:flex;gap:8px"><button id="bLog" style="flex:1">Показать последние строки</button><button id="bLogHide" style="flex:1" hidden>Скрыть</button></div>
+    <pre id="logBox" hidden></pre>
+  </div>
+</main>
+
+<div id="gate"></div>
+
+<div class="sheet-back" id="sheetBack"><div class="sheet" id="sheet"></div></div>
+<div id="toast"></div>
+
+<script>
+(function () {
+  var tg = window.Telegram && window.Telegram.WebApp;
+  var $ = function (id) { return document.getElementById(id); };
+  var initData = tg ? tg.initData : "";
+  var state = null, busy = false, restarting = false;
+
+  if (tg) { tg.ready(); tg.expand(); try { tg.setHeaderColor("secondary_bg_color"); tg.setBackgroundColor("secondary_bg_color"); } catch (e) {} }
+  if (!initData) {
+    var g = $("gate"); g.style.display = "block";
+    g.textContent = "Откройте это приложение из Telegram: кнопка «Управление» рядом с полем ввода в личке с ботом.";
+    return;
+  }
+  $("app").hidden = false;
+
+  function toast(msg, bad) {
+    var t = $("toast"); t.textContent = msg; t.className = "show" + (bad ? " bad" : "");
+    clearTimeout(toast.t); toast.t = setTimeout(function () { t.className = ""; }, 2800);
+    if (tg && tg.HapticFeedback) { try { tg.HapticFeedback.notificationOccurred(bad ? "error" : "success"); } catch (e) {} }
+  }
+
+  function api(path, body) {
+    var opt = { headers: { "X-Init-Data": initData } };
+    if (body) { opt.method = "POST"; opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
+    return fetch(path, opt).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (j) {
+        if (!r.ok) throw new Error(j.error || ("Ошибка " + r.status));
+        return j;
+      });
+    });
+  }
+
+  function confirmBox(text, yes) {
+    if (tg && tg.showConfirm) tg.showConfirm(text, function (ok) { if (ok) yes(); });
+    else if (window.confirm(text)) yes();
+  }
+
+  function act(body, opts) {
+    if (busy) return;
+    busy = true;
+    return api("/api/action", body).then(function (res) {
+      toast(res.message || "Готово");
+      if (res.restarting) { restarting = true; setTimeout(function () { restarting = false; load(); }, 9000); }
+      else load();
+    }).catch(function (e) { toast(e.message, true); })
+      .then(function () { busy = false; });
+  }
+
+  function seg(el, values, current, onPick) {
+    el.innerHTML = "";
+    values.forEach(function (v) {
+      var b = document.createElement("button");
+      b.textContent = v.label; if (String(v.value) === String(current)) b.className = "on";
+      b.onclick = function () { if (String(v.value) !== String(current)) onPick(v.value); };
+      el.appendChild(b);
+    });
+  }
+
+  function render(s) {
+    state = s;
+    $("dot").className = "dot " + s.level;
+    var title = s.status.split("\n")[0].replace(/^[^\p{L}\p{N}]+/u, "");
+    $("stTitle").textContent = title;
+    $("stErr").textContent = s.lastErr && !s.connected ? s.lastErr : "";
+    $("nChats").textContent = s.chats; $("nMuted").textContent = s.muted.length;
+    $("selfId").textContent = s.selfId || "–";
+    $("bPause").hidden = !!s.paused; $("bResume").hidden = !s.paused;
+    $("bResync").disabled = s.syncing; $("bResync").textContent = s.syncing ? "⏳ Синхронизация…" : "🔄 Пересинхронизация";
+
+    var m = $("muted"); m.innerHTML = "";
+    if (!s.muted.length) {
+      m.innerHTML = '<div class="empty">Заглушенных чатов нет. Чат заглушают командой /ban в его теме.</div>';
+    } else {
+      s.muted.forEach(function (c) {
+        var d = document.createElement("div"); d.className = "muted-item";
+        var sp = document.createElement("span"); sp.textContent = c.title;
+        var b = document.createElement("button"); b.textContent = "🔔 Вернуть";
+        b.onclick = function () { act({ action: "unban", key: c.key }); };
+        d.appendChild(sp); d.appendChild(b); m.appendChild(d);
+      });
+    }
+
+    seg($("segHist"), [0, 20, 50, 100].map(function (n) { return { label: n, value: n }; }), s.history,
+      function (n) { act({ action: "history", n: n }); });
+    seg($("segSync"), [0, 50, 200].map(function (n) { return { label: n, value: n }; }), s.sync,
+      function (n) { act({ action: "sync", n: n }); });
+    seg($("segTr"), [{ label: "авто", value: "" }, { label: "TCP", value: "tcp" }, { label: "WS", value: "ws" }], s.transport,
+      function (v) { confirmBox("Сменить транспорт? Мост перезапустится.", function () { act({ action: "transport", value: v }); }); });
+    $("trLabel").textContent = s.transportLabel;
+    $("proxyNow").textContent = "сейчас: " + (s.proxy || "нет (напрямую)");
+    $("verNow").textContent = "сейчас: " + s.version;
+  }
+
+  function load() {
+    if (restarting) return Promise.resolve();
+    return api("/api/state").then(render).catch(function (e) {
+      $("dot").className = "dot bad"; $("stTitle").textContent = "Нет связи с мостом"; $("stErr").textContent = e.message;
+    });
+  }
+
+  $("bResume").onclick = function () { act({ action: "resume" }); };
+  $("bResync").onclick = function () { act({ action: "resync" }); };
+  $("bRestart").onclick = function () { confirmBox("Перезапустить мост? Займёт несколько секунд.", function () { act({ action: "restart" }); }); };
+  $("bPause").onclick = function () {
+    var opts = [["10 минут", 600], ["1 час", 3600], ["1 сутки", 86400], ["До перезапуска", 0]];
+    var sh = $("sheet"); sh.innerHTML = "<h3>На сколько поставить MAX на паузу?</h3>";
+    opts.forEach(function (o) {
+      var b = document.createElement("button"); b.textContent = o[0];
+      b.onclick = function () { closeSheet(); act({ action: "pause", seconds: o[1] }); };
+      sh.appendChild(b);
+    });
+    var c = document.createElement("button"); c.textContent = "Отмена"; c.className = "danger"; c.onclick = closeSheet; sh.appendChild(c);
+    $("sheetBack").classList.add("open");
+  };
+  function closeSheet() { $("sheetBack").classList.remove("open"); }
+  $("sheetBack").onclick = function (e) { if (e.target === $("sheetBack")) closeSheet(); };
+
+  $("bProxy").onclick = function () {
+    var v = $("proxyIn").value.trim();
+    if (!v) { toast("Введите адрес прокси или - чтобы убрать", true); return; }
+    confirmBox("Сохранить прокси и перезапустить мост?", function () { act({ action: "proxy", value: v }); });
+  };
+  $("bVer").onclick = function () {
+    var v = $("verIn").value.trim();
+    confirmBox(v ? "Задать версию " + v + " и перезапустить мост?" : "Включить автоподбор версии и перезапустить мост?",
+      function () { act({ action: "version", value: v }); });
+  };
+
+  function loadLog() {
+    api("/api/log?n=80").then(function (r) {
+      var box = $("logBox"); box.hidden = false; box.textContent = r.log || "(пусто)"; box.scrollTop = box.scrollHeight;
+      $("bLog").textContent = "Обновить"; $("bLogHide").hidden = false;
+    }).catch(function (e) { toast(e.message, true); });
+  }
+  $("bLog").onclick = loadLog;
+  $("bLogHide").onclick = function () { $("logBox").hidden = true; $("bLogHide").hidden = true; $("bLog").textContent = "Показать последние строки"; };
+
+  load();
+  setInterval(function () { if (!document.hidden && !busy) load(); }, 10000);
+  document.addEventListener("visibilitychange", function () { if (!document.hidden) load(); });
+})();
+</script>
+</body>
+</html>

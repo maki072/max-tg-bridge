@@ -35,6 +35,12 @@ type Config struct {
 	// BrowserMatchURL is the page URL substring to look for (default web.max.ru).
 	BrowserMatchURL string `json:"browser_match_url"`
 
+	// WebAppListen is where the Mini App's HTTP server listens (a reverse proxy
+	// with HTTPS sits in front of it); "-" turns the Mini App off. WebAppURL is
+	// the public https address Telegram opens; empty = no menu button.
+	WebAppListen string `json:"webapp_listen,omitempty"`
+	WebAppURL    string `json:"webapp_url,omitempty"`
+
 	// State file (token, deviceId, chat<->topic map, tg offset)
 	StatePath string `json:"state_path"`
 
@@ -124,6 +130,9 @@ func load(path string) (*Config, error) {
 	}
 	if cfg.BrowserMatchURL == "" {
 		cfg.BrowserMatchURL = "web.max.ru"
+	}
+	if cfg.WebAppListen == "" {
+		cfg.WebAppListen = "127.0.0.1:8095"
 	}
 	// Default the CDP endpoint to the standard local debug port so browser
 	// token refresh works out of the box (an empty field otherwise disabled it).

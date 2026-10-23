@@ -51,6 +51,8 @@ type Bridge struct {
 	promptMu sync.Mutex
 	prompts  map[int64]prompt // admin user id -> panel question awaiting an answer
 
+	web webAuthState // the Mini App's auth cache and action lock (webapp.go)
+
 	loginMu sync.Mutex
 	logins  map[int64]*loginFlow // admin user id -> MAX sign-in in progress (login.go)
 	botName string               // the bot's @username, for deep links
@@ -985,6 +987,10 @@ func (b *Bridge) handleAdminPM(chatID int64, text string) {
 		},
 		ResizeKeyboard:  true,
 		OneTimeKeyboard: false,
+	}
+
+	if u := b.cfg.WebAppURL; u != "" {
+		menu.Keyboard = append([][]tg.KeyboardButton{{{Text: "📱 Приложение", WebApp: &tg.WebAppInfo{URL: u}}}}, menu.Keyboard...)
 	}
 
 	// Транслируем текстовые кнопки в команды

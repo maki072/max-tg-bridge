@@ -137,6 +137,7 @@ func (p *Program) run() {
 	log.Printf("[app] bridge starting (tg group %d)", p.cfg.TelegramGroupID)
 	go maxClient.Run()
 	go br.RunPollRefresher()
+	go br.RunWebApp()
 	if p.cfg.DinnerURL != "" && p.cfg.DinnerToken != "" {
 		if p.cfg.DinnerChatID == 0 {
 			log.Printf("[dinner] dinner_chat_id не задан — автоотправка обедов выключена")

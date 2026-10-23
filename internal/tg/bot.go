@@ -732,7 +732,21 @@ func truncateName(s string) string {
 }
 
 type KeyboardButton struct {
-	Text string `json:"text"`
+	Text   string      `json:"text"`
+	WebApp *WebAppInfo `json:"web_app,omitempty"` // opens a Mini App (private chats only)
+}
+
+// WebAppInfo is the address of a Telegram Mini App.
+type WebAppInfo struct {
+	URL string `json:"url"`
+}
+
+// SetMenuButtonWebApp makes the bot's default menu button (next to the input
+// field in every private chat) open the Mini App at url.
+func (b *Bot) SetMenuButtonWebApp(text, url string) error {
+	return b.call("setChatMenuButton", map[string]any{
+		"menu_button": map[string]any{"type": "web_app", "text": text, "web_app": WebAppInfo{URL: url}},
+	}, nil)
 }
 
 type ReplyKeyboardMarkup struct {
