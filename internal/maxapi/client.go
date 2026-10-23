@@ -975,10 +975,9 @@ func (c *Client) SendPhoto(chatID int64, data []byte, caption string, replyToMax
 	if json.Unmarshal(resp.Payload, &up) != nil || up.URL == "" {
 		return "", fmt.Errorf("no upload url in PHOTO_UPLOAD response: %s", string(resp.Payload))
 	}
-	photoID, err := photoIDFromUploadURL(up.URL)
-	if err != nil {
-		return "", err
-	}
+	// Newer MAX builds hand out an opaque upload URL without a photoIds query
+	// param; the upload response is then read by whatever id it carries.
+	photoID, _ := photoIDFromUploadURL(up.URL)
 	token, err := httpUploadPhoto(up.URL, data, photoID)
 	if err != nil {
 		return "", err
