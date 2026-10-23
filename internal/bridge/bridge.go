@@ -568,6 +568,7 @@ func (b *Bridge) OnMaxReaction(r maxapi.IncomingReaction) {
 	chatKey := strconv.FormatInt(r.ChatID, 10)
 	threadID, ok := b.st.Topic(chatKey)
 	if !ok {
+		log.Printf("[bridge] reaction in chat %s dropped: no topic for it", chatKey)
 		return
 	}
 	if len(r.Counters) == 0 {

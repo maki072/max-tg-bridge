@@ -1712,6 +1712,7 @@ func (c *Client) tryReaction(f Frame) {
 		Counters:   counters,
 		TotalCount: total,
 	}
+	log.Printf("[max] reaction push (opcode %d): chat=%d msg=%s counters=%v", f.Opcode, chatID, r.MessageID, counters)
 	select {
 	case c.reactions <- r:
 	default:
