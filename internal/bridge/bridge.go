@@ -1243,6 +1243,11 @@ func (b *Bridge) restart() {
 		log.Printf("[bridge] restart: cannot locate exe: %v (staying up)", err)
 		return // do not exit if we cannot relaunch — a dead process won't come back
 	}
+	if os.Getenv("INVOCATION_ID") != "" {
+		// Under systemd a child would be killed with the unit's cgroup when we exit;
+		// just exit and let Restart=always bring the service back.
+		os.Exit(0)
+	}
 	cmd := exec.Command(exe, "run", "-config", b.configPath) // relaunch self in-session
 	if err := cmd.Start(); err != nil {
 		log.Printf("[bridge] restart: relaunch failed: %v (staying up)", err)
