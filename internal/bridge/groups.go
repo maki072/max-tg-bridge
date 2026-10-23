@@ -83,7 +83,7 @@ func (b *Bridge) openDialog(msg *tg.Message, pendingKey string) {
 		b.notify(fmt.Sprintf("ℹ️ Чат с этим контактом уже существует (тема %d) — сообщение отправлено туда.", existing))
 		return
 	}
-	b.st.SeenAndMark("max:" + maxMsgID) // skip our own echo
+	b.st.MarkDelivered(chatKey, maxMsgID) // skip our own echo
 	b.st.MoveTopic(pendingKey, chatKey)
 	b.st.LinkMessages(chatKey, maxMsgID, msg.MessageID, thread)
 	log.Printf("[bridge] opened MAX dialog %s with user %d (topic %d)", chatKey, userID, thread)

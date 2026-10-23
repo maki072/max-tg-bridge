@@ -109,12 +109,24 @@ func (b *Bridge) OnMaxMessage(m maxapi.IncomingMessage) {
 	if b.st.IsBanned(chatKey) { // muted chat: no mirror, no topic
 		return
 	}
-	if m.Time > 0 {
-		b.st.BumpLastSync(chatKey, m.Time) // advance the resync watermark regardless of dedup outcome below
-	}
-	if m.MessageID != "" && b.st.SeenAndMark("max:"+m.MessageID) {
+	// Reserve the message: a live push and a resync can both see it, and only
+	// one of them may post it. The reservation is confirmed once Telegram took
+	// the message, and given back (so a resync retries it) if delivery failed.
+	claimed := m.MessageID != ""
+	if claimed && !b.st.Claim(chatKey, m.MessageID) {
 		return
 	}
+	posted := false
+	defer func() {
+		if !claimed {
+			return
+		}
+		if posted {
+			b.st.Done(chatKey, m.MessageID)
+		} else {
+			b.st.Release(m.MessageID)
+		}
+	}()
 
 	// Wait out any resync in progress for this chat's topic (see syncGate) so
 	// this live message can never jump ahead of, or interleave with, a
@@ -146,13 +158,15 @@ func (b *Bridge) OnMaxMessage(m maxapi.IncomingMessage) {
 	}
 	b.st.SetTitle(chatKey, m.ChatTitle)
 
-	b.postMessage(threadID, m)
+	posted = b.postMessage(threadID, m)
 }
 
 // postMessage renders one MAX message into a topic (header + text + media),
 // then records the tg<->max message link so later reactions/replies/deletes
-// (in either direction) can find their way back to this message.
-func (b *Bridge) postMessage(threadID int, m maxapi.IncomingMessage) {
+// (in either direction) can find their way back to this message. It reports
+// false only when the message's text could not be sent at all, i.e. when
+// retrying later is worthwhile and cannot duplicate anything.
+func (b *Bridge) postMessage(threadID int, m maxapi.IncomingMessage) bool {
 	prefix := ""
 	if m.Outgoing {
 		prefix = "➡️ "
@@ -189,6 +203,7 @@ func (b *Bridge) postMessage(threadID int, m maxapi.IncomingMessage) {
 		}
 	}
 	kbOnText := false
+	textFailed := false
 	if strings.TrimSpace(m.Text) != "" {
 		body := header + ":\n" + m.Text
 		tgID, err := b.bot.SendToTopicMarkup(threadID, body, replyToTg, kbMarkup)
@@ -204,6 +219,7 @@ func (b *Bridge) postMessage(threadID int, m maxapi.IncomingMessage) {
 		if err != nil {
 			log.Printf("[bridge] sendToTopic %d failed: %v", threadID, err)
 			b.alert("tg-send", "⚠️ Не удалось отправить сообщение из MAX в Telegram: "+shortErr(err), 10*time.Minute)
+			textFailed = tgID == 0
 		}
 		link(tgID)
 	}
@@ -228,6 +244,7 @@ func (b *Bridge) postMessage(threadID int, m maxapi.IncomingMessage) {
 		}
 		link(b.forwardAttachment(threadID, header, att, replyToTg))
 	}
+	return !textFailed || linked
 }
 
 // onNewTopic posts the chat avatar and backfills recent history into a new topic.
@@ -239,37 +256,55 @@ func (b *Bridge) onNewTopic(threadID int, chatID int64) {
 }
 
 // backfillHistory posts up to count of the chat's most recent MAX messages
-// into threadID, in chronological order, skipping anything at or before the
-// chat's LastSync watermark (already covered by an earlier backfill or live
-// delivery — this is what keeps a repeated resync from re-posting the same
-// old messages once the bounded Seen dedup set has evicted their ids) and,
-// as a second-layer guard, anything still in Seen. Used both when a topic is
-// first created and, via SyncAllChats, to catch an already-mapped chat up
-// after a reconnect. Locking is the caller's responsibility (see syncGate).
-// Returns how many were posted.
+// into threadID, in chronological order. A message is skipped when it is at or
+// before the chat's baseline (it was in Telegram before the delivered-messages
+// registry existed) or when the registry already has it (see store/delivered.go;
+// the claim also keeps a concurrent live push from posting it twice). A message
+// whose text could not be sent is released, so the next resync retries it. Used
+// both when a topic is first created and, via SyncAllChats, to catch an
+// already-mapped chat up after a reconnect. Locking is the caller's
+// responsibility (see syncGate). Returns how many were posted.
 func (b *Bridge) backfillHistory(threadID int, chatID int64, count int) int {
 	chatKey := strconv.FormatInt(chatID, 10)
-	watermark := b.st.LastSyncTime(chatKey)
+	baseline := b.st.LastSyncTime(chatKey)
 	posted := 0
-	var newest int64
 	for _, hm := range b.max.History(chatID, count) {
-		if hm.Time > newest {
-			newest = hm.Time
+		if baseline > 0 && hm.Time > 0 && hm.Time <= baseline {
+			continue // delivered before the registry existed
 		}
-		if watermark > 0 && hm.Time > 0 && hm.Time <= watermark {
-			continue // already covered by a previous sync/live delivery
-		}
-		if hm.MessageID != "" && b.st.SeenAndMark("max:"+hm.MessageID) {
+		if !b.st.Claim(chatKey, hm.MessageID) {
 			continue
 		}
 		b.max.ResolveAttachments(&hm)
-		b.postMessage(threadID, hm)
-		posted++
+		if b.postMessage(threadID, hm) {
+			b.st.Done(chatKey, hm.MessageID)
+			posted++
+		} else {
+			b.st.Release(hm.MessageID)
+		}
+	}
+	return posted
+}
+
+// baselineChat records a mapped chat whose delivery history is unknown (no
+// registry rows, no baseline — e.g. a state file restored without it) as
+// already delivered: its recent history is marked and not posted. Re-posting
+// "everything not known" would flood the topic with old messages.
+func (b *Bridge) baselineChat(chatID int64, count int) int {
+	chatKey := strconv.FormatInt(chatID, 10)
+	var newest int64
+	n := 0
+	for _, hm := range b.max.History(chatID, count) {
+		b.st.MarkDelivered(chatKey, hm.MessageID)
+		if hm.Time > newest {
+			newest = hm.Time
+		}
+		n++
 	}
 	if newest > 0 {
 		b.st.BumpLastSync(chatKey, newest)
 	}
-	return posted
+	return n
 }
 
 // SyncAllChats re-checks recent history for every MAX chat that already has a
@@ -301,6 +336,11 @@ func (b *Bridge) SyncAllChats() {
 	for chatKey, threadID := range topics {
 		chatID, err := strconv.ParseInt(chatKey, 10, 64)
 		if err != nil {
+			continue
+		}
+		if !b.st.ChatTracked(chatKey) {
+			n := b.baselineChat(chatID, b.cfg.SyncCount)
+			log.Printf("[bridge] sync: chat %s had no delivery record; marked its last %d message(s) as delivered instead of re-posting them", chatKey, n)
 			continue
 		}
 		total += b.backfillHistory(threadID, chatID, b.cfg.SyncCount)
@@ -967,7 +1007,7 @@ func (b *Bridge) handleUpdate(u tg.Update) {
 		b.reportSendFailure(msg.MessageThreadID, msg.MessageID, "отправить сообщение", err)
 	}
 	if maxMsgID != "" {
-		b.st.SeenAndMark("max:" + maxMsgID) // skip our own echo
+		b.st.MarkDelivered(chatKey, maxMsgID) // skip our own echo
 		b.st.LinkMessages(chatKey, maxMsgID, msg.MessageID, msg.MessageThreadID)
 	}
 }

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"encoding/json"
 	"os"
 	"sync"
@@ -21,16 +22,18 @@ type Store struct {
 	TokenKind string          `json:"token_kind"` // "desktop" (browserless sign-in) or "web"; empty = legacy web
 	TgOffset  int64           `json:"tg_offset"`
 	ChatTopic map[string]int  `json:"chat_topic"` // maxChatID -> tg thread id
-	Seen      []string        `json:"seen"`       // recent message ids (dedupe)
+	Seen      []string        `json:"seen"` // legacy bounded dedupe list; imported into delivered.db once, then emptied
 	seenSet   map[string]bool `json:"-"`
 
-	// LastSync is a per-chat watermark: the timestamp (ms) of the newest MAX
-	// message already delivered to Telegram for that chat, whether via a live
-	// push or a history backfill. Unlike Seen (bounded, so old entries get
-	// evicted under enough churn), this never shrinks, so a history resync can
-	// always tell "already delivered" from "genuinely new" without depending on
-	// what's still left in the Seen ring buffer.
-	LastSync map[string]int64 `json:"last_sync"` // maxChatID -> newest delivered message time (ms)
+	db *sql.DB `json:"-"` // delivered-messages registry (delivered.go)
+
+	// LastSync is a per-chat baseline: the timestamp (ms) of the newest MAX
+	// message that was already in Telegram before the delivered-messages
+	// registry existed (or when the chat was first seen with unknown history).
+	// History at or before it is never re-posted. It is not advanced afterwards:
+	// everything newer is tracked per message in the registry, so a message whose
+	// delivery failed can never be skipped just because a later one succeeded.
+	LastSync map[string]int64 `json:"last_sync"` // maxChatID -> baseline message time (ms)
 
 	// MsgLinks is a bounded, bidirectional map between a MAX message
 	// (chatID+messageID) and the Telegram message that mirrors it, used for
@@ -64,7 +67,6 @@ type MsgLink struct {
 	ThreadID  int    `json:"thread_id"`
 }
 
-const maxSeen = 2000
 const maxMsgLinks = 3000
 
 // Load reads the state file (or returns an empty store).
@@ -82,6 +84,9 @@ func Load(path string) (*Store, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
+			if err := s.openDelivered(); err != nil {
+				return nil, err
+			}
 			return s, nil
 		}
 		return nil, err
@@ -107,6 +112,9 @@ func Load(path string) (*Store, error) {
 	}
 	s.rebuildMsgIndex()
 	s.path = path
+	if err := s.openDelivered(); err != nil {
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -267,6 +275,7 @@ func (s *Store) RemoveChat(maxChatID string) int {
 	thread := s.ChatTopic[maxChatID]
 	delete(s.ChatTopic, maxChatID)
 	delete(s.LastSync, maxChatID)
+	s.forgetChat(maxChatID)
 	delete(s.Titles, maxChatID)
 	kept := s.MsgLinks[:0]
 	for _, l := range s.MsgLinks {
@@ -401,29 +410,6 @@ func (s *Store) ChatByTopic(threadID int) (string, bool) {
 		}
 	}
 	return "", false
-}
-
-// SeenAndMark reports whether id was already seen; marks it otherwise.
-func (s *Store) SeenAndMark(id string) bool {
-	if id == "" {
-		return false
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.seenSet[id] {
-		return true
-	}
-	s.seenSet[id] = true
-	s.Seen = append(s.Seen, id)
-	if len(s.Seen) > maxSeen {
-		drop := s.Seen[:len(s.Seen)-maxSeen]
-		for _, d := range drop {
-			delete(s.seenSet, d)
-		}
-		s.Seen = s.Seen[len(s.Seen)-maxSeen:]
-	}
-	_ = s.save()
-	return false
 }
 
 // Token kinds: which kind of MAX client a stored session token was minted for.
