@@ -42,15 +42,23 @@ func httpDownload(url string, maxBytes int64) ([]byte, string, error) {
 // tooLarge=true with no data, so callers can post the link instead of uploading
 // a corrupt, unplayable partial file. Used for video/audio, which can be big.
 func httpDownloadCapped(url string, maxBytes int64) (data []byte, contentType string, tooLarge bool, err error) {
+	return httpDownloadHeaders(url, maxBytes, true)
+}
+
+// httpDownloadHeaders is httpDownloadCapped with the browser-like request
+// headers optional (MAX CDN nodes differ in which variant they accept).
+func httpDownloadHeaders(url string, maxBytes int64, browser bool) (data []byte, contentType string, tooLarge bool, err error) {
 	client := &http.Client{Timeout: 5 * time.Minute}
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, "", false, err
 	}
 	// MAX's video CDN can reject header-less Go requests with a 400.
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
-	req.Header.Set("Referer", "https://web.max.ru/")
-	req.Header.Set("Origin", "https://web.max.ru")
+	if browser {
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+		req.Header.Set("Referer", "https://web.max.ru/")
+		req.Header.Set("Origin", "https://web.max.ru")
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, "", false, err
@@ -127,4 +135,45 @@ func isAudioFile(name string) bool {
 		return true
 	}
 	return false
+}
+
+// downloadVideo fetches a MAX video, walking the offered qualities best-first:
+// a quality that is over the Telegram upload limit or that the CDN refuses
+// (HTTP 400 "10" on okcdn was seen live) falls through to the next lower one.
+// Each URL is tried first with plain Go headers, then with browser-like ones —
+// either may be what a given CDN node accepts. A round that failed only on
+// 5xx/network errors is repeated once after a pause. tooLarge is true when no
+// quality fit and at least one was merely too big.
+func downloadVideo(urls []string, maxBytes int64) (data []byte, tooLarge bool, err error) {
+	for round := 0; round < 2; round++ {
+		if round > 0 {
+			time.Sleep(3 * time.Second)
+		}
+		transient := false
+		for _, u := range urls {
+			if u == "" {
+				continue
+			}
+			for _, browser := range []bool{false, true} {
+				d, _, big, e := httpDownloadHeaders(u, maxBytes, browser)
+				switch {
+				case e == nil && big:
+					tooLarge = true
+				case e == nil && len(d) > 0:
+					return d, false, nil
+				case e != nil:
+					err = e
+					if !strings.HasPrefix(e.Error(), "http 4") {
+						transient = true
+					}
+					continue
+				}
+				break // too large / empty: another header set won't help
+			}
+		}
+		if !transient {
+			break
+		}
+	}
+	return nil, tooLarge, err
 }

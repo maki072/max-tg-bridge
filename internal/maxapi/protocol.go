@@ -298,8 +298,14 @@ type Attachment struct {
 	URL      string // direct, publicly fetchable URL (photo/file/video, and voice when MAX exposes one)
 	Name     string // file name (for documents) or a human label for other kinds
 	Duration int64  // duration in ms (voice notes)
-	Text     string // extra text (e.g. a poll question, when the server includes one)
-	Poll     *Poll  // set for Kind "poll"
+	// Kind "video": Width/Height as MAX shows it (rotation applied; 0 when
+	// unknown), Round for a "кружочек" video message (videoType 1), AltURLs the
+	// remaining MP4 qualities (best first) to fall back to when URL won't download.
+	Width, Height int
+	Round         bool
+	AltURLs       []string
+	Text          string // extra text (e.g. a poll question, when the server includes one)
+	Poll          *Poll  // set for Kind "poll"
 
 	// Kind "share": URL, Name (title), Text (description), Host.
 	// Kind "contact": Name, Phone. Kind "sticker": URL (static PNG), LottieURL
@@ -365,16 +371,19 @@ type IncomingMessage struct {
 // only arrive in full over the binary transport (see binproto.go); over JSON
 // the server sends a bare UNSUPPORTED instead.
 type attach struct {
-	Type     string      `json:"_type"`
-	BaseURL  string      `json:"baseUrl"`
-	FileURL  string      `json:"fileUrl"`
-	URL      string      `json:"url"`
-	Name     string      `json:"name"`
-	Duration int64       `json:"duration"` // ms, present on voice/audio attaches
-	FileID   json.Number `json:"fileId"`   // FILE attaches: internal id, pairs with Token
-	VideoID  json.Number `json:"videoId"`  // VIDEO attaches: internal id, pairs with Token
-	AudioID  json.Number `json:"audioId"`  // AUDIO/UNSUPPORTED (voice) attaches: internal id, pairs with Token
-	Token    string      `json:"token"`    // internal token that pairs with fileId/videoId/audioId
+	Type      string      `json:"_type"`
+	BaseURL   string      `json:"baseUrl"`
+	FileURL   string      `json:"fileUrl"`
+	URL       string      `json:"url"`
+	Name      string      `json:"name"`
+	Duration  int64       `json:"duration"` // ms, present on voice/audio attaches
+	FileID    json.Number `json:"fileId"`   // FILE attaches: internal id, pairs with Token
+	VideoID   json.Number `json:"videoId"`  // VIDEO attaches: internal id, pairs with Token
+	AudioID   json.Number `json:"audioId"`  // AUDIO/UNSUPPORTED (voice) attaches: internal id, pairs with Token
+	Token     string      `json:"token"`    // internal token that pairs with fileId/videoId/audioId
+	Width     int         `json:"width"`    // VIDEO attaches: size as shown (rotation applied)
+	Height    int         `json:"height"`
+	VideoType int         `json:"videoType"` // VIDEO attaches: 1 = round video message
 
 	// POLL attaches (confirmed from live binary frames):
 	// {pollId, title, answers:[{answerId,text}], state:{result:[{answerId,voteCount,...}], total}}
@@ -582,7 +591,7 @@ func toAttachments(as []attach) []Attachment {
 			if u == "" {
 				u = a.FileURL
 			}
-			att := Attachment{Kind: "video", URL: u, Name: a.Name}
+			att := Attachment{Kind: "video", URL: u, Name: a.Name, Width: a.Width, Height: a.Height, Round: a.VideoType == 1}
 			if u == "" && a.VideoID != "" {
 				// No direct URL — MAX web pushes normally omit one for video and
 				// expect the client to call VIDEO_PLAY (opcode 83) instead.

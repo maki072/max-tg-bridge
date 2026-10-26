@@ -295,15 +295,16 @@ func (b *Bridge) forwardAttachment(threadID int, header string, att maxapi.Attac
 		}
 		return id
 	case "video":
-		// Videos carry a large signed CDN URL. Download it and re-upload so it
-		// plays inside Telegram; fall back to a document, then to posting the
-		// link (video missing / too big for the bot upload limit / fetch error).
-		data, _, tooLarge, err := httpDownloadCapped(att.URL, tgUploadLimit)
-		if att.URL == "" || tooLarge || err != nil || len(data) == 0 {
-			if err != nil {
+		// Videos carry a large signed CDN URL. Download it (best quality first,
+		// stepping down on a refusal or when over the upload limit) and re-upload
+		// so it plays inside Telegram; fall back to a document, then to posting
+		// the link (video missing / too big for the bot upload limit / fetch error).
+		data, tooLarge, err := downloadVideo(append([]string{att.URL}, att.AltURLs...), tgUploadLimit)
+		if att.URL == "" || len(data) == 0 {
+			if tooLarge {
+				log.Printf("[bridge] video exceeds %d bytes in every quality; posting link", tgUploadLimit)
+			} else if err != nil {
 				log.Printf("[bridge] video download failed: %v; posting link", err)
-			} else if tooLarge {
-				log.Printf("[bridge] video exceeds %d bytes; posting link", tgUploadLimit)
 			}
 			id, _ := b.bot.SendToTopic(threadID, caption+" 🎥 "+att.URL, replyToTg)
 			return id
@@ -312,7 +313,15 @@ func (b *Bridge) forwardAttachment(threadID int, header string, att maxapi.Attac
 		if name == "" {
 			name = "video.mp4"
 		}
-		id, err := b.bot.SendVideo(threadID, data, name, caption, replyToTg)
+		if att.Round {
+			// Telegram renders the round bubble only through sendVideoNote.
+			if id, err := b.bot.SendVideoNote(threadID, data, replyToTg, min(att.Width, att.Height)); err == nil {
+				return id
+			} else {
+				log.Printf("[bridge] sendVideoNote failed: %v; sending as video", err)
+			}
+		}
+		id, err := b.bot.SendVideo(threadID, data, name, caption, replyToTg, att.Width, att.Height)
 		if err != nil {
 			log.Printf("[bridge] sendVideo failed: %v; sending as document", err)
 			id, err = b.bot.SendDocument(threadID, data, name, caption, replyToTg)

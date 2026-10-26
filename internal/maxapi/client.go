@@ -184,10 +184,10 @@ type Client struct {
 	pendOp  map[int]int // seq -> opcode of in-flight requests (reply matching when the server doesn't echo seq)
 	pendMu  sync.Mutex
 
-	tcp              bool // desktop TCP transport (tcp.go) instead of a WebSocket
+	tcp              bool   // desktop TCP transport (tcp.go) instead of a WebSocket
 	appVersion       string // pinned desktop appVersion ("" = TCPVersion())
 	verBumps         int    // consecutive auto version bumps since the last good LOGIN
-	tcpConn         net.Conn
+	tcpConn          net.Conn
 	tcpR             *bufio.Reader
 	saveDesktopToken func(deviceID, token string)
 	selfID           int64
@@ -1127,7 +1127,9 @@ func (c *Client) resolveAttachments(chatID int64, messageID string, atts []Attac
 		var resolved string
 		switch atts[i].ResolveKind {
 		case "video":
-			resolved = c.getVideoURL(chatID, messageID, atts[i].ResolveID)
+			if urls := c.getVideoURLs(chatID, messageID, atts[i].ResolveID); len(urls) > 0 {
+				resolved, atts[i].AltURLs = urls[0], urls[1:]
+			}
 		case "file":
 			resolved = c.getFileURL(chatID, messageID, atts[i].ResolveID)
 		case "audio":
@@ -1139,47 +1141,52 @@ func (c *Client) resolveAttachments(chatID int64, messageID string, atts []Attac
 	}
 }
 
-// getVideoURL resolves a playable URL for a VIDEO attach via VIDEO_PLAY
-// (opcode 83). Mirrors the confirmed client behavior: prefer the
-// highest-numbered "MP4_<n>" key, fall back to dynamicUrl/dynamic_url, then
-// EXTERNAL (a web-player link — still useful as an "open to watch" fallback).
-func (c *Client) getVideoURL(chatID int64, messageID string, videoID int64) string {
+// getVideoURLs resolves playable URLs for a VIDEO attach via VIDEO_PLAY
+// (opcode 83), best first: every "MP4_<n>" key by descending quality, else
+// dynamicUrl/dynamic_url/EXTERNAL (a web-player link — still useful as an
+// "open to watch" fallback). The bridge walks the list when the CDN refuses a
+// quality or it is over the Telegram upload limit.
+func (c *Client) getVideoURLs(chatID int64, messageID string, videoID int64) []string {
 	resp, err := c.request(OpVideoPlay, map[string]any{
 		"chatId": chatID, "messageId": msgIDArg(messageID), "videoId": videoID,
 	}, 15*time.Second)
 	if err != nil {
 		log.Printf("[max] VIDEO_PLAY failed for videoId=%d: %v", videoID, err)
-		return ""
+		return nil
 	}
 	var r map[string]any
 	if json.Unmarshal(resp.Payload, &r) != nil {
-		return ""
+		return nil
 	}
-	bestQuality, bestURL := -1, ""
+	type mp4 struct {
+		q   int
+		url string
+	}
+	var mp4s []mp4
 	for k, v := range r {
 		s, ok := v.(string)
-		if !ok || s == "" {
-			continue
-		}
 		up := strings.ToUpper(k)
-		if !strings.HasPrefix(up, "MP4_") {
+		if !ok || s == "" || !strings.HasPrefix(up, "MP4_") {
 			continue
 		}
-		q, err := strconv.Atoi(strings.TrimPrefix(up, "MP4_"))
-		if err != nil || q <= bestQuality {
-			continue
+		if q, err := strconv.Atoi(strings.TrimPrefix(up, "MP4_")); err == nil {
+			mp4s = append(mp4s, mp4{q, s})
 		}
-		bestQuality, bestURL = q, s
 	}
-	if bestURL != "" {
-		return bestURL
+	sort.Slice(mp4s, func(i, j int) bool { return mp4s[i].q > mp4s[j].q })
+	var out []string
+	for _, m := range mp4s {
+		out = append(out, m.url)
+	}
+	if len(out) > 0 {
+		return out
 	}
 	for _, key := range []string{"dynamicUrl", "dynamic_url", "EXTERNAL"} {
 		if v, ok := r[key].(string); ok && v != "" {
-			return v
+			return []string{v}
 		}
 	}
-	return ""
+	return nil
 }
 
 // getFileURL resolves a temporary download URL for a FILE attach via

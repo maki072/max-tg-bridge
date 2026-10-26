@@ -35,12 +35,29 @@ func (b *Bot) SendDocument(threadID int, doc []byte, filename, caption string, r
 }
 
 // SendVideo uploads a video (Telegram plays it inline when the container/codec
-// is supported, otherwise the caller falls back to SendDocument).
-func (b *Bot) SendVideo(threadID int, video []byte, filename, caption string, replyToTgMsgID int64) (int64, error) {
+// is supported, otherwise the caller falls back to SendDocument). width/height
+// (0 = unknown) must be passed whenever MAX reports them: without them Telegram
+// guesses the shape and shows a vertical phone video squashed. Streaming is
+// always requested so the clip starts playing before it is fully loaded.
+func (b *Bot) SendVideo(threadID int, video []byte, filename, caption string, replyToTgMsgID int64, width, height int) (int64, error) {
 	if filename == "" {
 		filename = "video.mp4"
 	}
-	return b.sendMedia("sendVideo", "video", filename, video, threadID, caption, replyToTgMsgID)
+	extra := map[string]string{"supports_streaming": "true"}
+	if width > 0 && height > 0 {
+		extra["width"], extra["height"] = strconv.Itoa(width), strconv.Itoa(height)
+	}
+	return b.sendMediaWith("sendVideo", "video", filename, video, threadID, caption, replyToTgMsgID, extra)
+}
+
+// SendVideoNote uploads a round video message ("кружочек"). Telegram needs a
+// square clip here and takes no caption; length is the diameter in pixels.
+func (b *Bot) SendVideoNote(threadID int, video []byte, replyToTgMsgID int64, size int) (int64, error) {
+	var extra map[string]string
+	if size > 0 {
+		extra = map[string]string{"length": strconv.Itoa(size)}
+	}
+	return b.sendMediaWith("sendVideoNote", "video_note", "video_note.mp4", video, threadID, "", replyToTgMsgID, extra)
 }
 
 // SendVoice uploads a voice note. Telegram requires OGG/OPUS here; for other
@@ -76,6 +93,12 @@ type sentMessage struct {
 // doubling the failed calls. replyToTgMsgID, if non-zero, makes this a native
 // Telegram reply to that message (0 = no reply).
 func (b *Bot) sendMedia(method, field, filename string, data []byte, threadID int, caption string, replyToTgMsgID int64) (int64, error) {
+	return b.sendMediaWith(method, field, filename, data, threadID, caption, replyToTgMsgID, nil)
+}
+
+// sendMediaWith is sendMedia plus extra multipart form fields (video width,
+// height, supports_streaming, ...).
+func (b *Bot) sendMediaWith(method, field, filename string, data []byte, threadID int, caption string, replyToTgMsgID int64, extra map[string]string) (int64, error) {
 	body, err := b.doRequest(func() (*http.Request, error) {
 		var buf bytes.Buffer
 		w := multipart.NewWriter(&buf)
@@ -88,6 +111,9 @@ func (b *Bot) sendMedia(method, field, filename string, data []byte, threadID in
 		}
 		if replyToTgMsgID != 0 {
 			_ = w.WriteField("reply_to_message_id", strconv.FormatInt(replyToTgMsgID, 10))
+		}
+		for k, v := range extra {
+			_ = w.WriteField(k, v)
 		}
 		fw, err := w.CreateFormFile(field, filename)
 		if err != nil {
